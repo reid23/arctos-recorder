@@ -19,8 +19,18 @@ This system aims to:
 - increase the odds that games are actually recorded!
   - reduce reliance on player-supplied phones, with their variable
     storage capacity and battery life
+	
+## Assumptions
+
+ngl really unsure about which of these are reasonable
+
+- there is a power outlet available.
+- sufficient phones can be sourced.
+- The cell network is sufficiently strong to upload this data.
 
 ## Requirements Tree
+
+todo: finish this tree. currently only have L1 requirements.
 
 The system shall:
 1. get match footage on Arctos within 30 minutes of the end of the
