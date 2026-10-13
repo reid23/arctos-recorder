@@ -25,7 +25,7 @@ This system aims to:
 ngl really unsure about which of these are reasonable
 
 - there is a power outlet available.
-- sufficient phones can be sourced.
+- ~~sufficient phones can be sourced.~~
 - The cell network has 50Mb/s of upload speed.
 
 ## Requirements Tree
@@ -42,106 +42,89 @@ The system shall:
    once on a single Starlink connection
 5. require less than 60 minutes of day-of setup for one person to
    record five fields.
-6. cost less than $1000 to initially purchase for five fields (can be
+6. cost less than $ 1000 to initially purchase for five fields (can be
    reasonably paid off by a tournament over 3-ish years)
-7. cost less than $25 per tournament day to operate.
+7. cost less than $ 25 per tournament day to operate.
 
 
 ## Implementation Plan
 
-For each field:
-- two phones at the top of a pole
-- power & internet over PoE: one PoE cable into the top of the
-  pole. split into two usb-c cables to get power and internet to two
-  phones.
-- long poe cables from side of field to data tent
-- computer, poe injector router, and cell uplink in data tent
+There will be one central computer running a desktop app `bsw` (base
+software) and acting as a router. It will connect to a PoE switch,
+which connects to a recording device on each field. Each recording
+device will run the `csw` (camera software) app.
 
-Each phone will run the Arctos Recorder mobile app. The base station will
-run the Arctos Recorder Base Station desktop app.
+The recording devices will comprise of:
+- a 2.7m tripod
+- a Raspberry Pi 5 (2gb) with a PoE hat
+- two wide angle cameras (Camera Module 3 Wide, or equivalent)
+- a usb microphone
 
-### Mobile App Logic
+### `csw` logic
 
-```
-IF base station THEN
-	config comes from base station.
-	record matches locally. record the whole thing. upload to base station when they're done. 
-	when not recording a match, poll somewhere for a frame request. base station can ask for preview and get sent images at up to like 1 fps, or ask for a video of a specified length.
-ELSE
-	config comes from Arctos (require login)
-	while not recording, poll somewhere for a frame request. (same thing where arctos can also ask for a video of a specified length) the user can go to their profile and see all their active cameras and request slow previews. same place that they can manage their cameras and set them up.
-	record matches locally.
-	clip to points.
-	IF upload_automatically THEN
-		upload points to Arctos
-	ELSE
-		save points locally. allow user to upload when they want to. 
-	END
-END
-```
+1. wait for base station to connect. it will be available on a known
+   domain.
+2. make a request to the base station to register this camera.
+   - send ID info, camera calibration, sync time with base station.
+3. start the [low-res] stream. 1536×864 @ 30fps probably. mjpg, low
+   jpg quality. integrate audio somehow.
+4. poll at 1hz for match/point status on this field.
 
-when a base station is connected (poll a heartbeat fairly regularly), talk to the base station for:
-- config
-- video upload
-- frame requests
-- video sample requests
+When a match is going, start recording timestamped frames to an
+$n$-second ring buffer. Once a frame gets to the end of the
+buffer, if it was not within $\Delta t$ of a point, discard it.
 
-talk to arctos for:
-- match/point start/end times
-- if logged in, saying "im here but am connected to the base station, not arctos"
+If it was a part of a match, write (append) it to a file. Importantly,
+every time a frame is dropped, a new file is made. That way, every
+file is contiguous video/audio. For each file, the start and end
+timestamps will be saved.
 
-if the base station disconnects, keep going as normal, but switch to
-arctos mode. (if logged in. if not logged in, just store the data
-locally until the base station reconnects and you can upload).
+Each camera will run at a resolution of 2304x1296 at 56 frames per
+second and ten bit color depth. This gives a net data rate of
 
-config is:
-- camera ID of some sort (intrinsic to device? we should have a human name and a UUID. the human name should be based on the device name or something, and the uuid is the actual key. uuid should never change, even when restarting the app.)
-- event
-- field
-- upload automatically? (if there's no base station, should i auto-upload to arctos?)
-- a/v settings: resolution, framerate, bitrate, encoding, which camera, etc
+$$
+(2304 \times 1296 \,\mathrm{pixels})\left(\frac{56\, \mathrm{frames}}{\mathrm{seconds}}\right)\left(\frac{10 \,\mathrm{bits}}{\mathrm{pixel}}\right)=1.67\mathrm{Gbps}
+$$
 
-video metadata is:
-- camera ID
-- start time (system clock)
-- start time (arctos clock)
-- start time (base station clock) (if base station exists)
-- event
-- field
-- match
-- optional, but add as many as possible:
-  - camera location (gps)
-  - camera pose (imu+magnetometer)
-  
-  
-### Base Station Functionality
+this is a total of 3.25 Gbps for two cameras. Assuming we get at least
+5x compression from jpeg (which should be easily achievable at a
+reasonable quality level), this is 0.67Gbps of data to store. If we
+take $\Delta t = 10\mathrm{s}$, we get that our buffer will be
+836MB. We have 2gb of ram, so this should be feasible.
 
-The base station will have basically the same config section as would
-be available on arctos if not using a base station:
+Once the match ends, the video (with all the points concatenated) will
+be uploaded to the base station. Once the base station confirms
+receipt, the files should be deleted from the camera.
 
-- show all connected devices in a table. their rows should drop down to display a preview.
-- if gps & pose info is available, plot the devices on a map.
-- set each camera's field & event, and change the human name (which is what its labele as)
-- set up paired cameras: where we want to fuse footage from.
-- see status: recording vs idle, how much storage space there is, the status of any uploads, etc.
-- [arctos only] set 'upload automatically' flag
+### `bsw` logic
 
-The functionality is slightly different. On the base station, when a
-phone uploads a match, the process will be:
-0. save the video to disk
-1. add this video and its data to some sort of "to be processed" pile
+`bsw` will be either a complete dioxus app or a rust backend with a
+typescript frontend connected with `ts-rs`. not sure which. Maybe the
+former, since it'll be cleaner than opening a browser and running a
+command.
 
-then there's a separate thing that monitors this pile, and looks for
-match videos that are ready to be processed. (if a camera is paired
-with another, the videos shouldn't count as ready until both are
-uploaded)
+Anyway. `bsw` will:
+- poll Arctos for match data and relay it to the cameras 
+- present a UI for managing the cameras, viewing the streams, and
+  mapping them to fields on Arctos.
+- optionally stream the low-quality live stream over rtmp
+- receive match video clips and upload them to a server. This will
+  either happen as soon as they are received, or at a later time (ie,
+  just leave the videos on disk and then upload them at the end of the
+  day).
 
-1. clip to just points + buffer
-2. if its a pair, use [meow](https://github.com/jarsba/meow) or
-   [reco](https://github.com/reco-project/video-stitcher) or similar
-   to fuse the two into one. 
-3. concatenate the points together into one video, remeasuring the
-   length of each clip post-fuse. compute the timestamps.
-4. upload to arctos via the video api. arctos will handle uploading to
-   youtube.
-   
+The other key feature is panorama stitching. There will be two
+operating modes: local and cloud stitching. For local stitching, `bsw`
+will stitch together the low-quality streams live before streaming
+them, and stitch the video clips (and concatenate them) before
+uploading directly to Arctos. For cloud stitching mode, a separate
+server will handle the heavy compute task of stitching and
+concatenating all the videos.
+
+In order to account for latency, we'll have to update the Arctos
+scoreboard overlay (which should be optionally included in the feeds)
+to have a configurable latency.
+
+Stitching will be done with [meow](https://github.com/jarsba/meow),
+[reco](https://github.com/reco-project/video-stitcher) or similar.
+
