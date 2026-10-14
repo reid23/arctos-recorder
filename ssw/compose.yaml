@@ -1,0 +1,28 @@
+# docker compose -f ssw/compose.yaml up -d --build
+# Needs SSW_TOKEN (and optionally the ARCTOS_* variables) in the environment
+# or in ssw/.env.
+services:
+  ssw:
+    build:
+      context: ..
+      dockerfile: ssw/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "7800:7800"
+    volumes:
+      - ssw-data:/data
+    environment:
+      - SSW_TOKEN
+      - ARCTOS_URL
+      - ARCTOS_CF_ACCESS_CLIENT_ID
+      - ARCTOS_CF_ACCESS_CLIENT_SECRET
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  ssw-data:

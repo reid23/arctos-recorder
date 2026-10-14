@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["protocol", "arctos", "stitching", "csw", "bsw", "ssw"]
+default-members = ["protocol", "arctos", "stitching", "bsw", "ssw"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+protocol = { path = "protocol" }
+arctos = { path = "arctos" }
+stitching = { path = "stitching" }
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+reco-core = { git = "https://github.com/reco-project/video-stitcher", tag = "v0.5.4" }
+reco-io = { git = "https://github.com/reco-project/video-stitcher", tag = "v0.5.4" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "cookies", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+turbojpeg = "1.5"
+
+[profile.release]
+debug = "line-tables-only"

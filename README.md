@@ -3,8 +3,81 @@
 This repository will contain the system for automatically recording
 and editing Jugger games and uploading them to Arctos.
 
-Currently this project is in the design phase, so this space will just
-be used for documentation.
+## Usage
+
+The workspace has these crates:
+
+- `protocol`: the types and HTTP API shared by the cameras and the base
+  station.
+- `arctos`: the Arctos API client.
+- `stitching`: rendering recordings and stitching live previews with
+  [reco](https://github.com/reco-project/video-stitcher), shared by `bsw`
+  and `ssw`.
+- `csw`: the camera software. Linux/libcamera only, so it is built on the
+  Pi and is not a default workspace member.
+- `bsw`: the base station desktop app (Dioxus). Needs `ffmpeg` on the
+  `PATH`, and a GPU when stitching locally.
+- `ssw`: the cloud stitching server, run as a Docker container on a GPU
+  server (see `ssw/Dockerfile`).
+
+Cameras find the base station by broadcasting on UDP port 7701 and then
+talk to it on TCP port 7700, so both must be open on the camera network
+interface. On Ubuntu:
+
+```sh
+sudo ufw allow in on <camera interface> to any port 7700 proto tcp
+sudo ufw allow in on <camera interface> to any port 7701 proto udp
+```
+
+```sh
+just bsw          # run the base station
+just deploy-csw   # build csw on the Pi (ssh host `ar-sn1`) and run it as a service
+just csw-logs     # follow its logs
+just ssw-image    # build the cloud stitching server's Docker image
+```
+
+In the app's Settings, enter the tournament slug and an organizer
+account. Cameras show up under Cameras while they are on the network;
+assign each a field and it records that field's matches. When a match
+ends the camera uploads its recording, and the base station stitches it
+(or has the cloud server stitch it) and uploads it to the match on
+Arctos (see Jobs). The recording is deleted from the base station only
+once the video is on Arctos. Each camera's stitched live preview can be
+restreamed to an RTMP URL such as YouTube Live's.
+
+bsw and ssw talk to <https://events.californiajugger.org> unless these
+are set:
+
+| Variable | Meaning |
+|---|---|
+| `ARCTOS_URL` | Another Arctos server, e.g. `http://127.0.0.1:5000` |
+| `ARCTOS_CF_ACCESS_CLIENT_ID` | Cloudflare Access service token id, for servers behind Cloudflare One |
+| `ARCTOS_CF_ACCESS_CLIENT_SECRET` | ... and its secret |
+
+### Cloud stitching
+
+Run ssw on a host with an NVIDIA GPU and the NVIDIA Container Toolkit:
+
+```sh
+SSW_TOKEN=<secret> docker compose -f ssw/compose.yaml up -d --build
+```
+
+Then, in bsw's Settings, choose "In the cloud" and enter the server URL
+(`http://<host>:7800`) and the token. Recordings are then sent to the
+server, which stitches them, uploads them to Arctos with the organizer
+account from bsw, and deletes them. Each camera's previews are forwarded
+to the server too, which stitches them and restreams them to the
+camera's RTMP URL. The server keeps its data in the `/data` volume.
+
+### Calibration and cooling
+
+A camera's stitching calibration lives at `/etc/csw/calibration.json`
+on the Pi (a reco `MatchCalibration` at the recording resolution);
+`deploy/calibration.json` is an uncalibrated placeholder.
+
+The Pi needs active cooling: once it throttles, the ISP can't keep up
+with two cameras at 56 fps and frames are dropped. csw logs each
+camera's frame rate and dropped frames every 30 s.
 
 ## Objectives
 

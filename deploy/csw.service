@@ -1,0 +1,14 @@
+[Unit]
+Description=Arctos Recorder camera software
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/csw
+StateDirectory=csw
+Restart=always
+RestartSec=2
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

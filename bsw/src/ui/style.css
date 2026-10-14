@@ -1,0 +1,379 @@
+/* Classic desktop look (think EAGLE or OpenSCAD) in the colors of
+   californiajugger.org. */
+:root {
+  --red: #b71234;
+  --cream: #f4f6d7;
+  --brown: #584528;
+  --ink: #3b2f1f;
+  --ink-weak: #6d5c42;
+  --chrome: #e4e2c8;
+  --surface: #faf9f5;
+  --edge: #7d6c4c;
+  --light: #ffffff;
+  --shade: #a89a7a;
+}
+
+* {
+  box-sizing: border-box;
+  border-radius: 0;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font: 12px "Franklin Gothic Medium", "Libre Franklin", Tahoma, "DejaVu Sans", sans-serif;
+  color: var(--ink);
+  background: var(--chrome);
+  user-select: none;
+  cursor: default;
+}
+
+#main {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+p {
+  margin: 3px 0;
+}
+
+/* Panes */
+
+.workspace {
+  flex: 1;
+  display: flex;
+  gap: 3px;
+  padding: 3px;
+  min-height: 0;
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  box-shadow: 1px 1px 0 var(--light) inset;
+}
+
+.pane.cameras {
+  flex: 1;
+}
+
+.side {
+  width: 380px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-height: 0;
+}
+
+.side.wide {
+  flex: 1;
+  width: auto;
+}
+
+.side .pane {
+  flex: 1;
+}
+
+.pane-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 19px;
+  padding: 0 2px 0 6px;
+  background: linear-gradient(#6f5934, var(--brown));
+  color: var(--cream);
+  font-weight: bold;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.pane-title .close {
+  width: 16px;
+  height: 15px;
+  padding: 0;
+  font-size: 13px;
+  line-height: 11px;
+}
+
+.pane-body {
+  flex: 1;
+  overflow: auto;
+  padding: 6px;
+}
+
+.statusbar {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  font-size: 11px;
+  border-top: 1px solid var(--light);
+}
+
+.statusbar span {
+  padding: 1px 6px;
+  border: 1px solid;
+  border-color: var(--shade) var(--light) var(--light) var(--shade);
+}
+
+.statusbar span:last-child {
+  margin-left: auto;
+}
+
+/* Controls */
+
+button,
+select {
+  font: inherit;
+  color: var(--ink);
+  background: linear-gradient(#fbfaf0, #e6e3cb);
+  border: 1px solid var(--edge);
+  box-shadow: 1px 1px 0 var(--light) inset, -1px -1px 0 var(--shade) inset;
+  padding: 1px 8px;
+}
+
+button:active {
+  background: #dcd8bc;
+  box-shadow: 1px 1px 0 var(--shade) inset;
+}
+
+select {
+  padding: 1px 2px;
+}
+
+input[type="text"],
+input[type="password"] {
+  font: inherit;
+  color: var(--ink);
+  background: var(--light);
+  border: 1px solid var(--edge);
+  box-shadow: 1px 1px 0 #d8d2bc inset;
+  padding: 2px 3px;
+  user-select: text;
+}
+
+input:focus,
+select:focus,
+button:focus {
+  outline: 1px dotted var(--red);
+  outline-offset: 1px;
+}
+
+input[type="radio"],
+input[type="checkbox"] {
+  accent-color: var(--red);
+  margin: 0 4px 0 0;
+}
+
+input[type="range"] {
+  flex: 1;
+  accent-color: var(--red);
+}
+
+fieldset {
+  margin: 0 0 8px;
+  padding: 4px 8px 6px;
+  border: 1px solid var(--shade);
+  box-shadow: 1px 1px 0 var(--light), 1px 1px 0 var(--light) inset;
+}
+
+legend {
+  padding: 0 3px;
+  font-weight: bold;
+  color: var(--brown);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 3px 0;
+}
+
+.row input[type="text"],
+.row input[type="password"],
+.row select {
+  flex: 1;
+  min-width: 0;
+}
+
+.row .label {
+  width: 72px;
+  flex: none;
+}
+
+.row .value {
+  width: 42px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+label.radio,
+label.check {
+  display: flex;
+  align-items: center;
+  margin: 3px 12px 3px 0;
+}
+
+progress {
+  -webkit-appearance: none;
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: 9px;
+  margin-top: 2px;
+}
+
+progress::-webkit-progress-bar {
+  background: var(--light);
+  border: 1px solid var(--edge);
+}
+
+progress::-webkit-progress-value {
+  background: var(--red);
+}
+
+.muted {
+  color: var(--ink-weak);
+}
+
+.error {
+  color: var(--red);
+}
+
+.empty {
+  color: var(--ink-weak);
+  text-align: center;
+  padding: 24px;
+}
+
+/* Cameras */
+
+.camera-grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.camera {
+  flex: 1 1 360px;
+  max-width: 560px;
+  background: var(--light);
+  border: 1px solid var(--edge);
+}
+
+.camera-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--edge);
+}
+
+.camera-header b {
+  font-family: Impact, "Haettenschweiler", "Franklin Gothic Bold", sans-serif;
+  font-weight: normal;
+  font-size: 14px;
+  letter-spacing: 0.03em;
+  color: var(--red);
+}
+
+.camera-header .field {
+  margin-left: auto;
+}
+
+.viewer {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  background: #000;
+}
+
+.viewer.wide {
+  aspect-ratio: 32 / 9;
+}
+
+.viewer img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.viewer .pair {
+  display: flex;
+  height: 100%;
+}
+
+.viewer .pair img {
+  width: 50%;
+}
+
+.viewer .scoreboard {
+  position: absolute;
+  border: 0;
+  background: transparent;
+  pointer-events: none;
+}
+
+.camera-footer {
+  padding: 3px 4px 4px;
+  border-top: 1px solid var(--edge);
+}
+
+.camera-footer .recording {
+  color: var(--red);
+  font-weight: bold;
+}
+
+.camera-footer .stream {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 3px;
+}
+
+.camera-footer .stream input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Jobs */
+
+table.jobs {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--light);
+  border: 1px solid var(--edge);
+}
+
+table.jobs th {
+  text-align: left;
+  font-weight: normal;
+  padding: 1px 4px;
+  background: linear-gradient(#fbfaf0, #e6e3cb);
+  border: 1px solid var(--shade);
+}
+
+table.jobs td {
+  padding: 2px 4px;
+  border: 1px solid #e2ddca;
+  vertical-align: top;
+}
+
+table.jobs td.error {
+  user-select: text;
+}
