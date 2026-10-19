@@ -3,7 +3,8 @@
 use dioxus::prelude::*;
 
 use super::{use_hub, use_watch};
-use crate::settings::{Align, Settings as AllSettings, Stitching};
+use crate::account::AccountStatus;
+use crate::settings::{Align, Settings as AllSettings, Stitching, Workflow};
 
 #[component]
 pub fn Settings() -> Element {
@@ -18,25 +19,22 @@ pub fn Settings() -> Element {
             move |value: String| hub.update_settings(|s| change(s, value))
         }
     };
+    let toggle = {
+        let hub = hub.clone();
+        move |change: fn(&mut Workflow, bool)| {
+            let hub = hub.clone();
+            move |on: bool| hub.update_settings(|s| change(&mut s.workflow, on))
+        }
+    };
 
     rsx! {
         fieldset {
             legend { "Arctos" }
+            Account {}
             TextInput {
                 label: "Tournament",
                 value: settings.arctos.tournament.clone(),
                 onchange: update(|s, v| s.arctos.tournament = v),
-            }
-            TextInput {
-                label: "Organizer",
-                value: settings.arctos.credentials.username.clone(),
-                onchange: update(|s, v| s.arctos.credentials.username = v),
-            }
-            TextInput {
-                label: "Password",
-                kind: "password",
-                value: settings.arctos.credentials.password.clone(),
-                onchange: update(|s, v| s.arctos.credentials.password = v),
             }
             match &*fields.read() {
                 Ok(fields) if fields.is_empty() => rsx! { p { class: "muted", "No fields found." } },
@@ -78,6 +76,43 @@ pub fn Settings() -> Element {
             }
         }
         fieldset {
+            legend { "Resource Usage" }
+            WorkflowCheck {
+                label: "Live stream",
+                title: "Restream the camera views to their stream URLs",
+                checked: settings.workflow.live_stream,
+                onchange: toggle(|w, on| w.live_stream = on),
+            }
+            match settings.stitching {
+                Stitching::Local => rsx! {
+                    WorkflowCheck {
+                        label: "Stitch later",
+                        title: "Keep recordings here until you stitch them from the Jobs pane",
+                        checked: settings.workflow.stitch_later,
+                        onchange: toggle(|w, on| w.stitch_later = on),
+                    }
+                    WorkflowCheck {
+                        label: "Upload later",
+                        title: "Keep stitched videos until you upload them from the Jobs pane",
+                        checked: settings.workflow.upload_later,
+                        onchange: toggle(|w, on| w.upload_later = on),
+                    }
+                },
+                // The stitching server uploads what it stitches.
+                Stitching::Cloud => rsx! {
+                    WorkflowCheck {
+                        label: "Stitch and upload later",
+                        title: "Keep recordings here until you send them to the cloud from the Jobs pane",
+                        checked: settings.stitches_later(),
+                        onchange: toggle(|w, on| {
+                            w.stitch_later = on;
+                            w.upload_later = on;
+                        }),
+                    }
+                },
+            }
+        }
+        fieldset {
             legend { "Scoreboard overlay" }
             label { class: "check",
                 input {
@@ -88,7 +123,7 @@ pub fn Settings() -> Element {
                         move |e: FormEvent| hub.update_settings(|s| s.overlay.enabled = e.checked())
                     },
                 }
-                "Show the scoreboard on the camera views"
+                "Draw the scoreboard onto videos and live streams"
             }
             if settings.overlay.enabled {
                 AlignSelect {
@@ -131,6 +166,71 @@ pub fn Settings() -> Element {
                     oninput: update(|s, v| s.overlay.width = v.parse().unwrap_or(s.overlay.width)),
                 }
             }
+        }
+    }
+}
+
+#[component]
+fn Account() -> Element {
+    let hub = use_hub();
+    let status = use_watch(|hub| &hub.account.status);
+    let sign_in = {
+        let hub = hub.clone();
+        move |_| hub.account.sign_in()
+    };
+    match status() {
+        AccountStatus::SignedIn(user) => rsx! {
+            div { class: "row",
+                span { class: "label", "Account" }
+                span { class: "account", "{user.name}" }
+                button {
+                    onclick: move |_| {
+                        let hub = hub.clone();
+                        spawn(async move {
+                            if let Err(e) = hub.account.sign_out().await {
+                                tracing::warn!("signing out of Arctos: {e:#}");
+                            }
+                        });
+                    },
+                    "Sign out"
+                }
+            }
+        },
+        AccountStatus::SigningIn => rsx! {
+            div { class: "row",
+                span { class: "label", "Account" }
+                span { class: "account muted", "Allow access in your browser…" }
+                button { onclick: move |_| hub.account.cancel_sign_in(), "Cancel" }
+            }
+        },
+        AccountStatus::SignedOut { error } => rsx! {
+            div { class: "row",
+                span { class: "label", "Account" }
+                span { class: "account muted", "Not signed in" }
+                button { onclick: sign_in, "Sign in with Arctos" }
+            }
+            if let Some(error) = error {
+                p { class: "error", "{error}" }
+            }
+        },
+    }
+}
+
+#[component]
+fn WorkflowCheck(
+    label: &'static str,
+    title: String,
+    checked: bool,
+    onchange: EventHandler<bool>,
+) -> Element {
+    rsx! {
+        label { class: "check", title,
+            input {
+                r#type: "checkbox",
+                checked,
+                onchange: move |e: FormEvent| onchange.call(e.checked()),
+            }
+            "{label}"
         }
     }
 }

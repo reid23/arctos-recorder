@@ -5,6 +5,7 @@
 //! and stitches (locally or in the cloud) and uploads the match recordings
 //! they send back.
 
+mod account;
 mod cloud;
 mod discovery;
 mod fields;
@@ -20,11 +21,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arctos::Arctos;
-use stitching::recording::RecordingKey;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
+use crate::account::Account;
 use crate::hub::{Hub, Paths};
+use crate::jobs::Order;
 use crate::settings::Settings;
 
 fn main() -> Result<()> {
@@ -40,8 +42,10 @@ fn main() -> Result<()> {
             .join("arctos-recorder"),
     )?;
     let settings = Settings::load(&paths.settings())?;
+    let arctos = Arctos::from_env()?;
+    let account = Account::load(arctos.clone(), paths.account())?;
     let (job_queue, jobs) = mpsc::unbounded_channel();
-    let hub = Arc::new(Hub::new(paths, Arctos::from_env()?, settings, job_queue));
+    let hub = Arc::new(Hub::new(paths, arctos, account, settings, job_queue));
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.spawn(backend(hub.clone(), jobs));
@@ -49,7 +53,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-async fn backend(hub: Arc<Hub>, jobs: mpsc::UnboundedReceiver<RecordingKey>) {
+async fn backend(hub: Arc<Hub>, jobs: mpsc::UnboundedReceiver<Order>) {
     if let Err(e) = jobs::restore(&hub) {
         tracing::error!("restoring jobs: {e:#}");
     }

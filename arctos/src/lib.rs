@@ -5,37 +5,35 @@
 //! `ARCTOS_CF_ACCESS_CLIENT_ID` and `ARCTOS_CF_ACCESS_CLIENT_SECRET` to a
 //! service token.
 
+mod auth;
+
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use protocol::{Span, Timestamp};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
-use reqwest::multipart::{Form, Part};
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 
+pub use auth::{REDIRECT_PATH, TokenSource, Tokens, User};
+
 const DEFAULT_URL: &str = "https://events.californiajugger.org";
 /// Arctos rejects upload chunks larger than 16 MiB.
 const CHUNK_BYTES: usize = 8 << 20;
-
-/// A tournament organizer account.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Credentials {
-    pub username: String,
-    pub password: String,
-}
 
 #[derive(Clone)]
 pub struct Arctos {
     url: String,
     http: Client,
+    headers: HeaderMap,
 }
 
 impl Arctos {
@@ -52,13 +50,13 @@ impl Arctos {
             }
         }
         let http = Client::builder()
-            .default_headers(headers)
-            .cookie_store(true)
+            .default_headers(headers.clone())
             .connect_timeout(Duration::from_secs(5))
             .build()?;
         Ok(Arctos {
             url: url.trim_end_matches('/').to_owned(),
             http,
+            headers,
         })
     }
 
@@ -66,9 +64,15 @@ impl Arctos {
         &self.url
     }
 
-    /// Lists the tournament's fields. Logs in first, since unpublished
-    /// tournaments are only visible to their organizers.
-    pub async fn fields(&self, tournament: &str, credentials: &Credentials) -> Result<Vec<String>> {
+    /// Headers every request to Arctos needs, for clients other than this
+    /// one (e.g. a browser rendering the scoreboard).
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    /// Lists the tournament's fields. Unpublished tournaments are only
+    /// visible to their organizers.
+    pub async fn fields(&self, tournament: &str, token: &dyn TokenSource) -> Result<Vec<String>> {
         #[derive(Deserialize)]
         struct Fields {
             fields: Vec<Field>,
@@ -77,19 +81,75 @@ impl Arctos {
         struct Field {
             name: String,
         }
-        self.login(credentials).await?;
-        let url = format!("{}/_api/tournaments/{tournament}/fields", self.url);
-        let fields: Fields = json_response(self.http.get(url).send().await?).await?;
+        let fields: Fields = self
+            .get(
+                &format!("/tournaments/{}/fields", encode(tournament)),
+                token,
+            )
+            .await?;
         Ok(fields.fields.into_iter().map(|f| f.name).collect())
     }
 
-    pub async fn scoreboard(&self, tournament: &str, field: &str) -> Result<Scoreboard> {
-        let request = self
+    /// The match in progress on a field, if any.
+    pub async fn scoreboard(
+        &self,
+        tournament: &str,
+        field: &str,
+        token: &dyn TokenSource,
+    ) -> Result<Option<Scoreboard>> {
+        #[derive(Deserialize)]
+        struct Response {
+            r#match: Option<Scoreboard>,
+        }
+        let path = format!(
+            "/tournaments/{}/fields/{}/scoreboard",
+            encode(tournament),
+            encode(field)
+        );
+        let response: Response = self.get(&path, token).await?;
+        Ok(response.r#match)
+    }
+
+    /// Rendered scoreboard overlay images for every state of a match, each
+    /// `size` pixels with transparency, in the order they took effect.
+    pub async fn scoreboard_overlay(
+        &self,
+        tournament: &str,
+        match_id: &str,
+        (width, height): (u32, u32),
+    ) -> Result<Vec<OverlayFrame>> {
+        #[derive(Deserialize)]
+        struct Response {
+            frames: Vec<Frame>,
+        }
+        #[derive(Deserialize)]
+        struct Frame {
+            effective_at: DateTime<Utc>,
+            png: String,
+        }
+        let url = format!(
+            "{}/_api/tournaments/{}/matches/{}/scoreboard-overlay",
+            self.url,
+            encode(tournament),
+            encode(match_id)
+        );
+        let response = self
             .http
-            .get(format!("{}/_api/scoreboard-state", self.url))
-            .query(&[("tournament", tournament), ("field", field)])
-            .timeout(Duration::from_secs(3));
-        json_response(request.send().await?).await
+            .get(url)
+            .query(&[("width", width), ("height", height)])
+            .send()
+            .await?;
+        let response: Response = json_response(response).await?;
+        response
+            .frames
+            .into_iter()
+            .map(|frame| {
+                Ok(OverlayFrame {
+                    effective_at: frame.effective_at,
+                    png: STANDARD.decode(frame.png)?.into(),
+                })
+            })
+            .collect()
     }
 
     /// Fetches any page of the Arctos web app, e.g. to show the scoreboard
@@ -107,31 +167,18 @@ impl Arctos {
         })
     }
 
-    async fn login(&self, credentials: &Credentials) -> Result<()> {
-        let response = self
-            .http
-            .post(format!("{}/_api/login", self.url))
-            .json(credentials)
-            .send()
-            .await?;
-        json_response::<serde_json::Value>(response)
-            .await
-            .context("logging in to Arctos")?;
-        Ok(())
-    }
-
-    /// Uploads footage of a match, reporting progress in `[0, 1]`.
+    /// Uploads footage of a match, reporting progress in `[0, 1]`. The user
+    /// must organize the tournament.
     pub async fn upload_footage(
         &self,
-        credentials: &Credentials,
+        token: &dyn TokenSource,
         footage: &Footage<'_>,
         mut progress: impl FnMut(f32),
     ) -> Result<()> {
         #[derive(Deserialize)]
-        struct Init {
+        struct Upload {
             upload_id: String,
         }
-        self.login(credentials).await?;
         let Footage {
             tournament,
             match_id,
@@ -139,28 +186,25 @@ impl Arctos {
             video,
             anchors,
         } = footage;
-        let base = format!(
-            "{}/_api/tournaments/{tournament}/matches/{match_id}/footage/upload",
-            self.url
+        let uploads = format!(
+            "{}/api/v1/tournaments/{}/matches/{}/footage/uploads",
+            self.url,
+            encode(tournament),
+            encode(match_id)
         );
         let mut file = tokio::fs::File::open(video).await?;
         let size = file.metadata().await?.len() as usize;
         let total_chunks = size.div_ceil(CHUNK_BYTES);
 
-        let init: Init = json_response(
-            self.http
-                .post(format!("{base}/init"))
-                .json(&json!({
-                    "camera_name": camera,
-                    "filename": "panorama.mp4",
-                    "content_type": "video/mp4",
-                    "total_chunks": total_chunks,
-                    "anchors": anchors,
-                }))
-                .send()
-                .await?,
-        )
-        .await?;
+        let request = self.http.post(&uploads).json(&json!({
+            "camera_name": camera,
+            "filename": "panorama.mp4",
+            "content_type": "video/mp4",
+            "total_chunks": total_chunks,
+            "anchors": anchors,
+        }));
+        let upload: Upload = self.send(request, token).await?;
+        let upload = format!("{uploads}/{}", encode(&upload.upload_id));
 
         for index in 0..total_chunks {
             let mut chunk = Vec::with_capacity(CHUNK_BYTES);
@@ -168,35 +212,49 @@ impl Arctos {
                 .take(CHUNK_BYTES as u64)
                 .read_to_end(&mut chunk)
                 .await?;
-            let form = Form::new()
-                .text("upload_id", init.upload_id.clone())
-                .text("chunk_index", index.to_string())
-                .part("chunk", Part::bytes(chunk).file_name("chunk"));
-            let response = self
+            let request = self
                 .http
-                .post(format!("{base}/chunk"))
-                .multipart(form)
-                .send()
-                .await?;
-            json_response::<serde_json::Value>(response).await?;
+                .put(format!("{upload}/chunks/{index}"))
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .body(chunk);
+            self.send::<serde_json::Value>(request, token).await?;
             progress((index + 1) as f32 / total_chunks as f32);
         }
 
-        let response = self
-            .http
-            .post(format!("{base}/complete"))
-            .json(&json!({ "upload_id": init.upload_id }))
-            .send()
-            .await?;
-        json_response::<serde_json::Value>(response).await?;
+        let request = self.http.post(format!("{upload}/complete"));
+        self.send::<serde_json::Value>(request, token).await?;
         Ok(())
     }
+
+    async fn get<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        token: &dyn TokenSource,
+    ) -> Result<T> {
+        let request = self
+            .http
+            .get(format!("{}/api/v1{path}", self.url))
+            .timeout(Duration::from_secs(5));
+        self.send(request, token).await
+    }
+
+    async fn send<T: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        token: &dyn TokenSource,
+    ) -> Result<T> {
+        let token = token.access_token().await?;
+        json_response(request.bearer_auth(token).send().await?).await
+    }
+}
+
+fn encode(segment: &str) -> percent_encoding::PercentEncode<'_> {
+    utf8_percent_encode(segment, NON_ALPHANUMERIC)
 }
 
 /// Path (and query) of a field's scoreboard overlay page.
 pub fn scoreboard_path(tournament: &str, field: &str) -> String {
     // The page decodes `%20` but not `+` in the query.
-    let encode = |text| utf8_percent_encode(text, NON_ALPHANUMERIC);
     format!("/{}/scoreboard?field={}", encode(tournament), encode(field))
 }
 
@@ -206,15 +264,18 @@ pub struct Page {
     pub body: Bytes,
 }
 
-/// The public scoreboard state of one field (`/_api/scoreboard-state`).
+/// The match in progress on a field.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Scoreboard {
-    pub has_active_match: bool,
-    pub match_id: Option<String>,
-    pub team1_name: Option<String>,
-    pub team2_name: Option<String>,
-    /// Only reported for stones matches.
-    pub points_for_stones: Option<Vec<ScoreboardPoint>>,
+    pub id: String,
+    pub team1: Team,
+    pub team2: Team,
+    pub points: Vec<ScoreboardPoint>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Team {
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -234,9 +295,16 @@ impl ScoreboardPoint {
 
 impl Scoreboard {
     pub fn title(&self) -> String {
-        let name = |n: &Option<String>| n.clone().unwrap_or_else(|| "?".into());
-        format!("{} vs {}", name(&self.team1_name), name(&self.team2_name))
+        let name = |team: &Team| team.name.clone().unwrap_or_else(|| "?".into());
+        format!("{} vs {}", name(&self.team1), name(&self.team2))
     }
+}
+
+/// One state of a match's scoreboard overlay.
+#[derive(Clone, Debug)]
+pub struct OverlayFrame {
+    pub effective_at: DateTime<Utc>,
+    pub png: Bytes,
 }
 
 pub fn timestamp(time: DateTime<Utc>) -> Timestamp {

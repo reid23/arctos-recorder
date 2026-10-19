@@ -72,6 +72,13 @@ impl Side {
         self as usize
     }
 
+    pub fn opposite(self) -> Side {
+        match self {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        }
+    }
+
     pub fn file_name(self) -> &'static str {
         match self {
             Side::Left => LEFT_FILE,
@@ -86,6 +93,28 @@ pub struct Registration {
     /// The rig's stitching calibration (a `reco` `MatchCalibration` for
     /// [`rig::RECORD_SIZE`]). Opaque to the camera.
     pub calibration: serde_json::Value,
+    /// The ALSA capture devices the camera can record audio from.
+    pub audio_devices: Vec<AudioDevice>,
+}
+
+/// An ALSA capture device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioDevice {
+    /// ALSA PCM name, e.g. `plughw:CARD=USB,DEV=0`.
+    pub name: String,
+    /// e.g. `Jabra SPEAK 410 USB, USB Audio`.
+    pub description: String,
+}
+
+/// The ALSA PCM cameras capture audio from unless told otherwise.
+pub const DEFAULT_AUDIO_DEVICE: &str = "default";
+
+/// What the base station currently wants a camera to do, polled at 1 Hz.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Instructions {
+    pub directive: Directive,
+    /// ALSA PCM name of the microphone to capture.
+    pub audio_device: String,
 }
 
 /// A stretch of play, e.g. one point. `end` is `None` while it is ongoing.
@@ -102,7 +131,7 @@ impl Span {
     }
 }
 
-/// What the base station currently wants a camera to do, polled at 1 Hz.
+/// What to record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Directive {
@@ -161,35 +190,54 @@ impl MatchManifest {
     }
 }
 
-/// A live preview JPEG, sent as one binary WebSocket message:
-/// `[side: u8][jpeg...]`.
+/// A live preview JPEG of one camera.
 #[derive(Clone, Debug)]
 pub struct PreviewFrame<B> {
     pub side: Side,
     pub jpeg: B,
 }
 
-impl<B: AsRef<[u8]>> PreviewFrame<B> {
+/// A message of the live preview WebSocket, sent as one binary message:
+/// `[tag: u8][payload...]`. The tag is the frame's [`Side`] for frames and
+/// [`AUDIO_TAG`] for audio.
+#[derive(Clone, Debug)]
+pub enum PreviewMessage<B> {
+    Frame(PreviewFrame<B>),
+    /// Microphone audio, as in [`AUDIO_FILE`], continuing the previous
+    /// audio message.
+    Audio(B),
+}
+
+const AUDIO_TAG: u8 = 2;
+
+impl<B: AsRef<[u8]>> PreviewMessage<B> {
     pub fn encode(&self) -> Vec<u8> {
-        let jpeg = self.jpeg.as_ref();
-        let mut out = Vec::with_capacity(1 + jpeg.len());
-        out.push(self.side as u8);
-        out.extend_from_slice(jpeg);
+        let (tag, payload) = match self {
+            PreviewMessage::Frame(frame) => (frame.side as u8, frame.jpeg.as_ref()),
+            PreviewMessage::Audio(pcm) => (AUDIO_TAG, pcm.as_ref()),
+        };
+        let mut out = Vec::with_capacity(1 + payload.len());
+        out.push(tag);
+        out.extend_from_slice(payload);
         out
     }
 }
 
-impl PreviewFrame<Bytes> {
+impl PreviewMessage<Bytes> {
     /// Splits an encoded message; `None` if it is malformed.
     pub fn decode(message: Bytes) -> Option<Self> {
-        let side = match *message.first()? {
-            0 => Side::Left,
-            1 => Side::Right,
+        let payload = message.slice(1..);
+        Some(match *message.first()? {
+            0 => PreviewMessage::Frame(PreviewFrame {
+                side: Side::Left,
+                jpeg: payload,
+            }),
+            1 => PreviewMessage::Frame(PreviewFrame {
+                side: Side::Right,
+                jpeg: payload,
+            }),
+            AUDIO_TAG => PreviewMessage::Audio(payload),
             _ => return None,
-        };
-        Some(PreviewFrame {
-            side,
-            jpeg: message.slice(1..),
         })
     }
 }

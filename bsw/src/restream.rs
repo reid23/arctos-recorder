@@ -7,6 +7,7 @@ use std::time::Duration;
 use stitching::restream;
 
 use crate::hub::{CameraLink, Hub};
+use crate::server::Feed;
 use crate::settings::{Settings, Stitching};
 
 pub async fn run(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) {
@@ -15,6 +16,7 @@ pub async fn run(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) {
             .then(|| settings.stream_url(&camera).map(str::to_owned))
             .flatten()
     };
+    let audio_url = Feed::Audio.url(&camera);
     let mut settings = hub.settings.subscribe();
     loop {
         let url = target(&settings.borrow_and_update());
@@ -30,7 +32,11 @@ pub async fn run(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) {
             continue;
         };
         tokio::select! {
-            result = restream::stream(url, link.panorama.subscribe()) => {
+            result = restream::stream(
+                url,
+                link.panorama.subscribe(),
+                restream::Audio::Pcm(&audio_url),
+            ) => {
                 if let Err(e) = result {
                     tracing::warn!("restreaming {camera}: {e:#}");
                 }

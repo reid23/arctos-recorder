@@ -23,7 +23,7 @@ struct Args {
     /// Token base stations must present as `Authorization: Bearer <token>`.
     #[arg(long, env = "SSW_TOKEN", hide_env_values = true)]
     token: String,
-    /// Where recordings are kept while they are processed.
+    /// Where recordings are kept while they are processed. Needn't persist.
     #[arg(long, env = "SSW_DATA_DIR", default_value = "/data")]
     data_dir: PathBuf,
 }

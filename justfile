@@ -1,3 +1,5 @@
+set dotenv-load
+
 pi := "ar-sn1"
 
 # Run the base station app.
@@ -6,7 +8,7 @@ bsw:
 
 # Build csw on a camera and (re)start it as a service (keeps its calibration).
 deploy-csw host=pi:
-    rsync -az --delete --exclude target --exclude .git ./ {{host}}:arctos-recorder/
+    rsync -az --delete --exclude target --exclude .git --exclude .env ./ {{host}}:arctos-recorder/
     ssh -t {{host}} 'cd arctos-recorder \
         && ~/.cargo/bin/cargo build --release -p csw \
         && sudo install target/release/csw /usr/local/bin/csw \

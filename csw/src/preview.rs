@@ -1,31 +1,43 @@
-//! Streams preview frames to the base station over a WebSocket.
+//! Streams preview frames and microphone audio to the base station over a
+//! WebSocket.
 
 use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::SinkExt;
-use protocol::PreviewFrame;
+use protocol::{PreviewFrame, PreviewMessage};
 use tokio::sync::mpsc::Receiver;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::base::BaseStation;
 
-pub async fn run(base: BaseStation, mut frames: Receiver<PreviewFrame<Vec<u8>>>) {
+pub struct Inputs {
+    pub frames: Receiver<PreviewFrame<Vec<u8>>>,
+    /// Little-endian PCM.
+    pub audio: Receiver<Vec<u8>>,
+}
+
+pub async fn run(base: BaseStation, mut inputs: Inputs) {
     loop {
-        if let Err(e) = stream(&base, &mut frames).await {
+        if let Err(e) = stream(&base, &mut inputs).await {
             tracing::debug!("preview stream: {e:#}");
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
-        // Don't send stale frames after reconnecting.
-        while frames.try_recv().is_ok() {}
+        // Don't send stale frames or audio after reconnecting.
+        while inputs.frames.try_recv().is_ok() {}
+        while inputs.audio.try_recv().is_ok() {}
     }
 }
 
-async fn stream(base: &BaseStation, frames: &mut Receiver<PreviewFrame<Vec<u8>>>) -> Result<()> {
+async fn stream(base: &BaseStation, inputs: &mut Inputs) -> Result<()> {
     let (mut socket, _) = tokio_tungstenite::connect_async(base.preview_url()).await?;
     tracing::info!("streaming previews");
-    while let Some(frame) = frames.recv().await {
-        socket.send(Message::binary(frame.encode())).await?;
+    loop {
+        let message = tokio::select! {
+            Some(frame) = inputs.frames.recv() => PreviewMessage::Frame(frame),
+            Some(pcm) = inputs.audio.recv() => PreviewMessage::Audio(pcm),
+            else => return Ok(()),
+        };
+        socket.send(Message::binary(message.encode())).await?;
     }
-    Ok(())
 }

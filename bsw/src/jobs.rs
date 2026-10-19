@@ -2,9 +2,12 @@
 //! locally or on the cloud server.
 //!
 //! Each recording lives in `recordings/<match id>/<camera>/` (see
-//! [`stitching::recording`]). Its media is deleted only once the video is on
-//! Arctos, leaving [`RECORDING_FILE`](stitching::recording::RECORDING_FILE)
-//! and [`UPLOADED_FILE`] behind as a record.
+//! [`stitching::recording`]). A recording is stitched (locally into
+//! [`VIDEO_FILE`], or on the cloud server, which uploads it too), then the
+//! video is uploaded. Either step can be held back by the settings until the
+//! user releases it. The media is deleted only once the video is on Arctos,
+//! leaving [`RECORDING_FILE`](stitching::recording::RECORDING_FILE) and
+//! [`UPLOADED_FILE`] behind as a record.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -12,9 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
+use arctos::TokenSource;
 use stitching::JobStatus;
 use stitching::cloud::JobRequest;
-use stitching::recording::{Recording, RecordingKey, render};
+use stitching::recording::{OverlayImages, Recording, RecordingKey, VIDEO_FILE, render};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::cloud::Cloud;
@@ -30,6 +34,13 @@ pub struct Job {
     pub key: RecordingKey,
     pub title: String,
     pub status: JobStatus,
+}
+
+/// A request to move a job along.
+pub struct Order {
+    pub key: RecordingKey,
+    /// Do the job's next step even if the settings say it should wait.
+    pub release: bool,
 }
 
 /// Lists recordings from previous runs, queueing the unfinished ones.
@@ -56,22 +67,17 @@ pub fn restore(hub: &Hub) -> Result<()> {
                     });
                 });
             } else {
-                hub.enqueue(key, recording.title);
+                hub.enqueue(key, recording.title, false);
             }
         }
     }
     Ok(())
 }
 
-pub async fn run(hub: Arc<Hub>, mut queue: UnboundedReceiver<RecordingKey>) {
-    while let Some(key) = queue.recv().await {
-        let stitching = hub.settings.borrow().stitching;
-        let result = match stitching {
-            Stitching::Local => process_locally(&hub, &key).await,
-            Stitching::Cloud => send_to_cloud(&hub, &key).await,
-        };
-        if let Err(e) = result {
-            fail(&hub, &key, e);
+pub async fn run(hub: Arc<Hub>, mut queue: UnboundedReceiver<Order>) {
+    while let Some(order) = queue.recv().await {
+        if let Err(e) = process(&hub, &order).await {
+            fail(&hub, &order.key, e);
         }
     }
 }
@@ -81,26 +87,35 @@ fn fail(hub: &Hub, key: &RecordingKey, error: anyhow::Error) {
     hub.set_job_status(key, JobStatus::Failed(format!("{error:#}")));
 }
 
-async fn process_locally(hub: &Arc<Hub>, key: &RecordingKey) -> Result<()> {
+async fn process(hub: &Arc<Hub>, order: &Order) -> Result<()> {
+    let key = &order.key;
     let dir = hub.paths.recording(key);
     let recording = Recording::load(&dir)?;
+    let settings = hub.settings.borrow().clone();
+    let mut release = order.release;
 
-    hub.set_job_status(key, JobStatus::Stitching(0.0));
-    let progress = {
-        let (hub, key) = (hub.clone(), key.clone());
-        Arc::new(move |p| hub.set_job_status(&key, JobStatus::Stitching(p)))
-    };
-    let (render_dir, render_recording) = (dir.clone(), recording.clone());
-    let video =
-        tokio::task::spawn_blocking(move || render(&render_dir, &render_recording, progress))
-            .await??;
+    let video = dir.join(VIDEO_FILE);
+    if !video.exists() {
+        if settings.stitches_later() && !release {
+            hub.set_job_status(key, JobStatus::StitchLater);
+            return Ok(());
+        }
+        release = false;
+        match settings.stitching {
+            Stitching::Local => stitch(hub, key, &dir, &recording).await?,
+            Stitching::Cloud => return send_to_cloud(hub, key, recording).await,
+        }
+    }
 
+    if settings.workflow.upload_later && !release {
+        hub.set_job_status(key, JobStatus::UploadLater);
+        return Ok(());
+    }
     hub.set_job_status(key, JobStatus::Uploading(0.0));
-    let credentials = hub.settings.borrow().arctos.credentials.clone();
     let anchors = recording.anchors();
     hub.arctos
         .upload_footage(
-            &credentials,
+            hub.account.as_ref(),
             &recording.footage(key, &video, &anchors),
             |p| hub.set_job_status(key, JobStatus::Uploading(p)),
         )
@@ -108,15 +123,55 @@ async fn process_locally(hub: &Arc<Hub>, key: &RecordingKey) -> Result<()> {
     finish(hub, key, &dir, &recording)
 }
 
+async fn stitch(
+    hub: &Arc<Hub>,
+    key: &RecordingKey,
+    dir: &Path,
+    recording: &Recording,
+) -> Result<()> {
+    hub.set_job_status(key, JobStatus::Stitching(0.0));
+    let placement = hub.settings.borrow().overlay.clone();
+    let overlay = if placement.enabled {
+        Some(OverlayImages::fetch(&hub.arctos, recording, &placement).await?)
+    } else {
+        None
+    };
+    let progress = {
+        let (hub, key) = (hub.clone(), key.clone());
+        Arc::new(move |p| hub.set_job_status(&key, JobStatus::Stitching(p)))
+    };
+    let (dir, recording) = (dir.to_owned(), recording.clone());
+    tokio::task::spawn_blocking(move || render(&dir, &recording, overlay.as_ref(), progress))
+        .await??;
+    Ok(())
+}
+
 /// Sends the recording to the cloud server, then follows its progress in the
 /// background so the next recording can be sent meanwhile.
-async fn send_to_cloud(hub: &Arc<Hub>, key: &RecordingKey) -> Result<()> {
-    let dir = hub.paths.recording(key);
-    let recording = Recording::load(&dir)?;
+async fn send_to_cloud(hub: &Arc<Hub>, key: &RecordingKey, recording: Recording) -> Result<()> {
     let cloud = Cloud::new(&hub.settings.borrow().cloud);
+    send_recording(hub, &cloud, key, &recording).await?;
+    let (hub, key) = (hub.clone(), key.clone());
+    tokio::spawn(async move {
+        if let Err(e) = follow_cloud_job(&hub, &cloud, &key, &recording).await {
+            fail(&hub, &key, e);
+        }
+    });
+    Ok(())
+}
+
+/// Creates the job on the cloud server and sends it the files it is missing.
+async fn send_recording(
+    hub: &Arc<Hub>,
+    cloud: &Cloud,
+    key: &RecordingKey,
+    recording: &Recording,
+) -> Result<()> {
+    let dir = hub.paths.recording(key);
+    let overlay = hub.settings.borrow().overlay.clone();
     let request = JobRequest {
         recording: recording.clone(),
-        credentials: hub.settings.borrow().arctos.credentials.clone(),
+        overlay: overlay.enabled.then_some(overlay),
     };
     let state = cloud.put_job(key, &request).await?;
 
@@ -144,28 +199,34 @@ async fn send_to_cloud(hub: &Arc<Hub>, key: &RecordingKey) -> Result<()> {
             )
             .await?;
     }
-
-    let (hub, key) = (hub.clone(), key.clone());
-    tokio::spawn(async move {
-        if let Err(e) = follow_cloud_job(&hub, &cloud, &key, &dir, &recording).await {
-            fail(&hub, &key, e);
-        }
-    });
     Ok(())
 }
 
+/// Follows the job on the cloud server until the video is on Arctos, keeping
+/// the server supplied with a fresh access token and sending the job again
+/// if the server lost it.
 async fn follow_cloud_job(
-    hub: &Hub,
+    hub: &Arc<Hub>,
     cloud: &Cloud,
     key: &RecordingKey,
-    dir: &Path,
     recording: &Recording,
 ) -> Result<()> {
+    let mut token_sent = None;
     loop {
-        match cloud.job(key).await?.status {
-            JobStatus::Done => return finish(hub, key, dir, recording),
+        let Some(state) = cloud.job(key).await? else {
+            send_recording(hub, cloud, key, recording).await?;
+            token_sent = None;
+            continue;
+        };
+        match state.status {
+            JobStatus::Done => return finish(hub, key, &hub.paths.recording(key), recording),
             JobStatus::Failed(error) => bail!("cloud stitching failed: {error}"),
             status => hub.set_job_status(key, status),
+        }
+        let token = hub.account.access_token().await?;
+        if !state.has_token || token_sent.as_ref() != Some(&token) {
+            cloud.put_token(key, &token).await?;
+            token_sent = Some(token);
         }
         tokio::time::sleep(CLOUD_POLL).await;
     }

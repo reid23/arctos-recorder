@@ -12,6 +12,8 @@ use reco_core::render::renderer::InputFormat;
 use reco_core::render::viewport::ViewportConfig;
 use turbojpeg::{Compressor, Decompressor, Image, PixelFormat, Subsamp, YuvImage};
 
+use crate::overlay::PlacedImage;
+
 /// Size of the stitched preview.
 pub const OUTPUT_SIZE: (u32, u32) = (1280, 720);
 /// Frame rate of the previews.
@@ -21,6 +23,8 @@ const JPEG_QUALITY: i32 = 70;
 pub struct LiveStitcher {
     core: StitchCore,
     compressor: Compressor,
+    /// The stitched frame with the overlay drawn on it.
+    composited: Vec<u8>,
 }
 
 impl LiveStitcher {
@@ -44,9 +48,16 @@ impl LiveStitcher {
         let mut core = StitchCore::new(GpuContext::new_blocking()?, config)?;
         // Previews are decoded from JPEGs, which are full range.
         core.pipeline_mut().set_full_range(true);
+        // Where the cameras' views don't meet, the panorama has black gaps;
+        // constraining the view to avoid them can zoom it in to nothing.
+        core.set_constrained_look(false);
         let mut compressor = Compressor::new()?;
         compressor.set_quality(JPEG_QUALITY)?;
-        Ok(LiveStitcher { core, compressor })
+        Ok(LiveStitcher {
+            core,
+            compressor,
+            composited: Vec::new(),
+        })
     }
 
     pub fn set_calibration(&mut self, calibration: &MatchCalibration) {
@@ -54,16 +65,31 @@ impl LiveStitcher {
             .update_calibration(preview_calibration(calibration));
     }
 
-    /// Stitches a pair of previews into a JPEG; `None` while the GPU is
-    /// still busy with earlier frames.
-    pub fn stitch(&mut self, frame: &StereoYuv) -> Result<Option<Bytes>> {
+    /// Stitches a pair of previews into a JPEG, with `overlay` drawn on
+    /// top; `None` while the GPU is still busy with earlier frames.
+    pub fn stitch(
+        &mut self,
+        frame: &StereoYuv,
+        overlay: Option<&PlacedImage>,
+    ) -> Result<Option<Bytes>> {
         let [left, right] = frame.planes();
         let RenderOutcome::Rgba(rgba) = self.core.submit_frame_yuv(&left, &right)? else {
             return Ok(None);
         };
+        let pixels = match overlay {
+            Some(overlay) => {
+                self.composited.clear();
+                self.composited.extend_from_slice(rgba);
+                overlay
+                    .image
+                    .draw_onto(&mut self.composited, OUTPUT_SIZE, overlay.position);
+                &self.composited[..]
+            }
+            None => rgba,
+        };
         let (width, height) = (OUTPUT_SIZE.0 as usize, OUTPUT_SIZE.1 as usize);
         let jpeg = self.compressor.compress_to_vec(Image {
-            pixels: rgba,
+            pixels,
             width,
             pitch: width * 4,
             height,
@@ -75,7 +101,7 @@ impl LiveStitcher {
 
 /// The calibration is for the recording resolution; previews have the same
 /// field of view at a lower resolution.
-fn preview_calibration(calibration: &MatchCalibration) -> MatchCalibration {
+pub(crate) fn preview_calibration(calibration: &MatchCalibration) -> MatchCalibration {
     let scale = rig::PREVIEW_SIZE.0 as f64 / rig::RECORD_SIZE.0 as f64;
     let mut scaled = calibration.clone();
     for camera in [&mut scaled.left, &mut scaled.right] {

@@ -29,6 +29,7 @@ pub async fn serve(jobs: Arc<Jobs>, token: String) -> Result<()> {
             "/api/jobs/{match_id}/{camera}/files/{segment}/{file}",
             put(upload_file),
         )
+        .route("/api/jobs/{match_id}/{camera}/token", put(put_token))
         .route("/api/live/{camera}", get(live))
         .layer(middleware::from_fn(move |request, next| {
             authorize(authorization.clone(), request, next)
@@ -108,10 +109,28 @@ async fn upload_file(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn live(Path(camera): Path<String>, upgrade: WebSocketUpgrade) -> Response {
+async fn put_token(
+    State(jobs): State<Arc<Jobs>>,
+    Path(key): Path<(String, String)>,
+    token: String,
+) -> ApiResult<StatusCode> {
+    let key = recording_key(key)?;
+    if jobs.state(&key).map_err(internal)?.is_none() {
+        return Err((StatusCode::NOT_FOUND, "no such job".into()));
+    }
+    jobs.set_token(&key, token);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn live(
+    State(jobs): State<Arc<Jobs>>,
+    Path(camera): Path<String>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let arctos = jobs.arctos().clone();
     upgrade.on_upgrade(move |socket| async move {
         tracing::info!("live preview of {camera} connected");
-        if let Err(e) = live::run(socket).await {
+        if let Err(e) = live::run(socket, &arctos).await {
             tracing::warn!("live preview of {camera}: {e:#}");
         }
         tracing::info!("live preview of {camera} disconnected");

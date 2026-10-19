@@ -2,19 +2,22 @@
 //!
 //! Each job lives in `<root>/<match id>/<camera>/`: [`REQUEST_FILE`] plus the
 //! recording's segment directories as they are uploaded. Once the video is on
-//! Arctos the directory is emptied except for [`DONE_FILE`].
+//! Arctos the directory is emptied except for [`DONE_FILE`]. Arctos access
+//! tokens are only kept in memory; base stations send them again when
+//! needed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use arctos::Arctos;
+use arctos::{Arctos, TokenSource};
+use futures_util::future::BoxFuture;
 use protocol::Segment;
 use stitching::JobStatus;
 use stitching::cloud::{JobRequest, JobState};
-use stitching::recording::{RecordingKey, render};
-use tokio::sync::mpsc;
+use stitching::recording::{OverlayImages, RecordingKey, VIDEO_FILE, render};
+use tokio::sync::{mpsc, watch};
 
 const REQUEST_FILE: &str = "job.json";
 const DONE_FILE: &str = "done";
@@ -23,6 +26,8 @@ pub struct Jobs {
     root: PathBuf,
     arctos: Arctos,
     statuses: Mutex<HashMap<RecordingKey, JobStatus>>,
+    /// The latest Arctos access token sent for each job.
+    tokens: Mutex<HashMap<RecordingKey, watch::Sender<Option<String>>>>,
     queue: mpsc::UnboundedSender<RecordingKey>,
 }
 
@@ -39,6 +44,7 @@ impl Jobs {
             root,
             arctos,
             statuses: Mutex::default(),
+            tokens: Mutex::default(),
             queue,
         };
         for match_dir in std::fs::read_dir(&jobs.root)? {
@@ -54,6 +60,10 @@ impl Jobs {
         Ok((jobs, queue_rx))
     }
 
+    pub fn arctos(&self) -> &Arctos {
+        &self.arctos
+    }
+
     pub fn dir(&self, key: &RecordingKey) -> PathBuf {
         self.root.join(&key.match_id).join(&key.camera)
     }
@@ -66,7 +76,12 @@ impl Jobs {
             JobStatus::Sending(_) => missing_files(&self.dir(key))?,
             _ => Vec::new(),
         };
-        Ok(Some(JobState { status, missing }))
+        let has_token = self.token(key).borrow().is_some();
+        Ok(Some(JobState {
+            status,
+            missing,
+            has_token,
+        }))
     }
 
     /// Creates a job, or retries it if it failed.
@@ -95,6 +110,18 @@ impl Jobs {
     /// complete.
     pub fn received(&self, key: &RecordingKey) -> Result<()> {
         self.refresh(key)
+    }
+
+    pub fn set_token(&self, key: &RecordingKey, token: String) {
+        self.token(key).send_replace(Some(token));
+    }
+
+    fn token(&self, key: &RecordingKey) -> watch::Sender<Option<String>> {
+        let mut tokens = self.tokens.lock().unwrap();
+        tokens
+            .entry(key.clone())
+            .or_insert_with(|| watch::channel(None).0)
+            .clone()
     }
 
     fn status(&self, key: &RecordingKey) -> Option<JobStatus> {
@@ -144,33 +171,56 @@ impl Jobs {
         let dir = self.dir(key);
         let request = load_request(&dir)?;
         let recording = &request.recording;
+        let token = JobToken(self.token(key).subscribe());
 
-        self.set_status(key, JobStatus::Stitching(0.0));
-        let progress = {
-            let (jobs, key) = (self.clone(), key.clone());
-            Arc::new(move |p| jobs.set_status(&key, JobStatus::Stitching(p)))
-        };
-        let (render_dir, render_recording) = (dir.clone(), recording.clone());
-        let video =
-            tokio::task::spawn_blocking(move || render(&render_dir, &render_recording, progress))
-                .await??;
+        // Left by an earlier attempt whose upload failed.
+        let video = dir.join(VIDEO_FILE);
+        if !video.exists() {
+            self.set_status(key, JobStatus::Stitching(0.0));
+            let overlay = match &request.overlay {
+                Some(placement) => {
+                    Some(OverlayImages::fetch(&self.arctos, recording, placement).await?)
+                }
+                None => None,
+            };
+            let progress = {
+                let (jobs, key) = (self.clone(), key.clone());
+                Arc::new(move |p| jobs.set_status(&key, JobStatus::Stitching(p)))
+            };
+            let (render_dir, render_recording) = (dir.clone(), recording.clone());
+            tokio::task::spawn_blocking(move || {
+                render(&render_dir, &render_recording, overlay.as_ref(), progress)
+            })
+            .await??;
+        }
 
         self.set_status(key, JobStatus::Uploading(0.0));
         let anchors = recording.anchors();
         self.arctos
-            .upload_footage(
-                &request.credentials,
-                &recording.footage(key, &video, &anchors),
-                |p| self.set_status(key, JobStatus::Uploading(p)),
-            )
+            .upload_footage(&token, &recording.footage(key, &video, &anchors), |p| {
+                self.set_status(key, JobStatus::Uploading(p))
+            })
             .await?;
 
-        // Neither the media nor the credentials are needed any more.
         tokio::fs::remove_dir_all(&dir).await?;
         tokio::fs::create_dir_all(&dir).await?;
         tokio::fs::write(dir.join(DONE_FILE), b"").await?;
+        self.tokens.lock().unwrap().remove(key);
         tracing::info!("finished {key:?}");
         Ok(())
+    }
+}
+
+/// The latest token sent for a job, waiting for one if there is none.
+struct JobToken(watch::Receiver<Option<String>>);
+
+impl TokenSource for JobToken {
+    fn access_token(&self) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            let mut token = self.0.clone();
+            let token = token.wait_for(Option::is_some).await?;
+            Ok(token.clone().expect("waited for a token"))
+        })
     }
 }
 

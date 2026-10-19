@@ -11,6 +11,8 @@ use futures_util::{SinkExt, StreamExt};
 use protocol::Side;
 use stitching::cloud::LiveConfig;
 use stitching::live::{self, LiveStitcher, StereoYuv};
+use stitching::overlay::{self, LiveOverlay, PlacedImage};
+use stitching::restream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::runtime::Handle;
@@ -20,6 +22,7 @@ use turbojpeg::Decompressor;
 
 use crate::cloud::Cloud;
 use crate::hub::{CameraLink, Hub};
+use crate::server::Feed;
 use crate::settings::{Settings, Stitching};
 
 /// Bit rate of the previews forwarded to the cloud server.
@@ -27,21 +30,59 @@ const FORWARD_BITRATE: &str = "6M";
 
 pub fn spawn(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) {
     let runtime = Handle::current();
+    let (overlay_images, overlay_images_rx) = watch::channel(None);
     let (thread_hub, thread_link) = (hub.clone(), link.clone());
     std::thread::Builder::new()
         .name(format!("live-{camera}"))
         .spawn(move || {
-            if let Err(e) = stitch_locally(&runtime, &thread_hub, &thread_link) {
+            if let Err(e) = stitch_locally(&runtime, &thread_hub, &thread_link, &overlay_images_rx)
+            {
                 tracing::error!("live stitching stopped: {e:#}");
             }
         })
         .expect("spawn live stitching thread");
+    tokio::spawn(show_overlay(hub.clone(), camera.clone(), overlay_images));
     tokio::spawn(forward_to_cloud(hub, camera, link));
+}
+
+/// Keeps `images` showing the scoreboard to draw over the locally stitched
+/// preview.
+async fn show_overlay(
+    hub: Arc<Hub>,
+    camera: String,
+    images: watch::Sender<Option<Arc<PlacedImage>>>,
+) {
+    let wanted = |settings: &Settings| {
+        settings
+            .live_overlay(&camera)
+            .filter(|_| settings.stitching == Stitching::Local)
+    };
+    let mut settings = hub.settings.subscribe();
+    let (config, config_rx) = watch::channel(wanted(&settings.borrow_and_update()));
+    let follow_settings = async {
+        while settings.changed().await.is_ok() {
+            let overlay = wanted(&settings.borrow_and_update());
+            config.send_if_modified(|current| {
+                let changed = *current != overlay;
+                *current = overlay;
+                changed
+            });
+        }
+    };
+    tokio::join!(
+        follow_settings,
+        overlay::follow_live(&hub.arctos, config_rx, &images, live::OUTPUT_SIZE)
+    );
 }
 
 /// Stitches the previews into [`CameraLink::panorama`] while stitching
 /// locally. The GPU is only set up once it is needed.
-fn stitch_locally(runtime: &Handle, hub: &Hub, link: &CameraLink) -> Result<()> {
+fn stitch_locally(
+    runtime: &Handle,
+    hub: &Hub,
+    link: &CameraLink,
+    overlay: &watch::Receiver<Option<Arc<PlacedImage>>>,
+) -> Result<()> {
     let mut calibration = link.calibration.subscribe();
     let mut left = link.previews[Side::Left.index()].subscribe();
     let right = link.previews[Side::Right.index()].subscribe();
@@ -68,7 +109,8 @@ fn stitch_locally(runtime: &Handle, hub: &Hub, link: &CameraLink) -> Result<()> 
             continue;
         };
         decode(&mut decompressor, &mut frame, &previews)?;
-        if let Some(jpeg) = stitcher.stitch(&frame)? {
+        let overlay = overlay.borrow().clone();
+        if let Some(jpeg) = stitcher.stitch(&frame, overlay.as_deref())? {
             link.panorama.send_replace(Some(jpeg));
         }
     }
@@ -95,6 +137,7 @@ fn decode(
 struct Forwarding {
     cloud: crate::settings::CloudSettings,
     stream_url: String,
+    overlay: Option<LiveOverlay>,
 }
 
 impl Forwarding {
@@ -103,6 +146,7 @@ impl Forwarding {
         Some(Forwarding {
             cloud: settings.cloud.clone(),
             stream_url: settings.stream_url(camera)?.to_owned(),
+            overlay: settings.live_overlay(camera),
         })
     }
 }
@@ -149,6 +193,7 @@ async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Re
     let config = LiveConfig {
         calibration: (**link.calibration.borrow()).clone(),
         stream_url: forwarding.stream_url.clone(),
+        overlay: forwarding.overlay.clone(),
     };
     socket
         .send(Message::text(serde_json::to_string(&config)?))
@@ -168,6 +213,9 @@ async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Re
             "pc",
         ])
         .args(["-video_size", &format!("{width}x{height}"), "-i", "-"])
+        .args(restream::Audio::Pcm(&Feed::Audio.url(camera)).input_args())
+        .args(["-map", "0:v"])
+        .args(restream::AUDIO_OUTPUT_ARGS)
         .args([
             "-c:v",
             "libx264",

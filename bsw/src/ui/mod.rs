@@ -9,6 +9,7 @@ mod jobs;
 mod settings;
 
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use dioxus::desktop::muda::{CheckMenuItem, Menu, MenuEvent, PredefinedMenuItem, Submenu};
@@ -18,15 +19,22 @@ use dioxus::desktop::{
     Config, LogicalSize, RequestAsyncResponder, WindowBuilder, icon_from_memory,
     use_muda_event_handler,
 };
+use dioxus::html::geometry::PixelsRect;
 use dioxus::prelude::*;
 use stitching::JobStatus;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::hub::Hub;
-use crate::settings::{Align, Panes, Stitching};
+use crate::settings::{Panes, Stitching};
 
 const STYLE: &str = include_str!("style.css");
+/// Must match `.workspace`'s padding in the style sheet.
+const WORKSPACE_PADDING: f64 = 3.0;
+/// The least a pane can be resized to, in pixels.
+const MIN_PANE_SIZE: f64 = 200.0;
+/// The narrowest a camera's box can be resized to, in pixels.
+const MIN_CAMERA_WIDTH: f64 = 240.0;
 const ICON: &[u8] = include_bytes!("../../assets/icon.png");
 /// Custom URL scheme proxying the Arctos web app, so its pages can be shown
 /// in the window (see [`proxy_arctos`]).
@@ -85,7 +93,7 @@ fn menu(panes: Panes) -> Menu {
     Menu::with_items(&[&file, &edit, &window]).expect("build menu")
 }
 
-/// Serves `arctos://<align>/<path>` from the Arctos server (see
+/// Serves `arctos://arctos/<path>` from the Arctos server (see
 /// [`arctos_url`]). Loading Arctos pages directly would open them in the
 /// browser (Dioxus sends every http(s) navigation there) and would need the
 /// Cloudflare Access headers.
@@ -95,11 +103,6 @@ fn proxy_arctos(
 ) -> impl Fn(dioxus::desktop::wry::WebViewId, Request<Vec<u8>>, RequestAsyncResponder) + 'static {
     move |_, request, responder| {
         let hub = hub.clone();
-        let align = match request.uri().host() {
-            Some("center") => Align::Center,
-            Some("end") => Align::End,
-            _ => Align::Start,
-        };
         let path = request
             .uri()
             .path_and_query()
@@ -109,14 +112,10 @@ fn proxy_arctos(
             let response = match hub.arctos.page(&path).await {
                 Ok(page) => {
                     let mut response = Response::builder().status(page.status.as_u16());
-                    let mut body = page.body.to_vec();
                     if let Some(content_type) = page.content_type {
-                        if content_type.as_bytes().starts_with(b"text/html") {
-                            body = align_page(&body, align);
-                        }
                         response = response.header(header::CONTENT_TYPE, content_type.as_bytes());
                     }
-                    response.body(body)
+                    response.body(page.body.to_vec())
                 }
                 Err(e) => Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
@@ -127,34 +126,9 @@ fn proxy_arctos(
     }
 }
 
-/// URL of an Arctos page (path and query) for showing it in the window, with
-/// its content pinned to the top, center, or bottom of the frame. The page
-/// can't be measured from outside, so this is how a scoreboard overlay
-/// anchored at the bottom stays at the bottom whatever its height.
-fn arctos_url(path: &str, align: Align) -> String {
-    let host = match align {
-        Align::Start => "start",
-        Align::Center => "center",
-        Align::End => "end",
-    };
-    format!("{ARCTOS_SCHEME}://{host}{path}")
-}
-
-/// Pins the Arctos web app's root element to the top, center, or bottom of
-/// the page.
-fn align_page(html: &[u8], align: Align) -> Vec<u8> {
-    let justify = match align {
-        Align::Start => return html.to_vec(),
-        Align::Center => "center",
-        Align::End => "flex-end",
-    };
-    let style = format!(
-        "<style>#main {{ position: fixed; inset: 0; display: flex; \
-         flex-direction: column; justify-content: {justify}; }}</style></head>"
-    );
-    String::from_utf8_lossy(html)
-        .replacen("</head>", &style, 1)
-        .into_bytes()
+/// URL of an Arctos page (path and query) for showing it in the window.
+fn arctos_url(path: &str) -> String {
+    format!("{ARCTOS_SCHEME}://arctos{path}")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,21 +209,109 @@ fn App() -> Element {
         }
     });
 
-    let panes = settings.read().panes;
+    let mut dragging = use_context_provider(|| Signal::new(None::<Drag>));
+    // Pane sizes while a splitter is dragged; saved when it is let go.
+    let mut resized = use_signal(|| None::<Panes>);
+    let mut workspace = use_signal(|| None::<Rc<MountedData>>);
+    let mut side = use_signal(|| None::<Rc<MountedData>>);
+
+    let panes = resized().unwrap_or(settings.read().panes);
     let closable = open_count(&panes) > 1;
+    let both_side_panes = panes.settings && panes.jobs;
+    let (settings_flex, jobs_flex) = if both_side_panes {
+        (panes.settings_share, 1.0 - panes.settings_share)
+    } else {
+        (1.0, 1.0)
+    };
+    let finish_drag = {
+        let hub = hub.clone();
+        move || {
+            dragging.set(None);
+            if let Some(sizes) = resized.take() {
+                hub.update_settings(|s| {
+                    s.panes.side_width = sizes.side_width;
+                    s.panes.settings_share = sizes.settings_share;
+                    s.panes.camera_width = sizes.camera_width;
+                });
+            }
+        }
+    };
+    let drag = move |e: MouseEvent| {
+        let Some(Drag { splitter, area }) = dragging() else {
+            return;
+        };
+        let point = e.client_coordinates();
+        let mut sizes = panes;
+        match splitter {
+            Splitter::Side => {
+                let width = area.max_x() - WORKSPACE_PADDING - point.x;
+                let widest =
+                    (area.width() - 2.0 * WORKSPACE_PADDING - MIN_PANE_SIZE).max(MIN_PANE_SIZE);
+                sizes.side_width = width.clamp(MIN_PANE_SIZE, widest);
+            }
+            Splitter::Settings => {
+                let share = (point.y - area.min_y()) / area.height();
+                let least = (MIN_PANE_SIZE / area.height()).min(0.5);
+                sizes.settings_share = share.clamp(least, 1.0 - least);
+            }
+            Splitter::CameraCorner => {
+                sizes.camera_width = (point.x - area.min_x()).max(MIN_CAMERA_WIDTH);
+            }
+        }
+        resized.set(Some(sizes));
+    };
+    let workspace_class = match dragging().map(|drag| drag.splitter) {
+        None => "workspace",
+        Some(Splitter::Side) => "workspace dragging columns",
+        Some(Splitter::Settings) => "workspace dragging rows",
+        Some(Splitter::CameraCorner) => "workspace dragging corner",
+    };
     rsx! {
         style { {STYLE} }
-        div { class: "workspace",
+        div {
+            class: workspace_class,
+            style: "--camera-width: {panes.camera_width}px",
+            onmounted: move |e| workspace.set(Some(e.data())),
+            onmousemove: drag,
+            onmouseup: {
+                let mut finish_drag = finish_drag.clone();
+                move |_| finish_drag()
+            },
             if panes.cameras {
                 PaneFrame { pane: Pane::Cameras, closable, cameras::Cameras {} }
             }
             if panes.settings || panes.jobs {
-                div { class: if panes.cameras { "side" } else { "side wide" },
+                if panes.cameras {
+                    div {
+                        class: "splitter columns",
+                        onmousedown: move |_| start_drag(dragging, Splitter::Side, workspace()),
+                    }
+                }
+                div {
+                    class: if panes.cameras { "side" } else { "side wide" },
+                    style: if panes.cameras { "width: {panes.side_width}px" },
+                    onmounted: move |e| side.set(Some(e.data())),
                     if panes.settings {
-                        PaneFrame { pane: Pane::Settings, closable, settings::Settings {} }
+                        PaneFrame {
+                            pane: Pane::Settings,
+                            closable,
+                            style: "flex: {settings_flex}",
+                            settings::Settings {}
+                        }
+                    }
+                    if both_side_panes {
+                        div {
+                            class: "splitter rows",
+                            onmousedown: move |_| start_drag(dragging, Splitter::Settings, side()),
+                        }
                     }
                     if panes.jobs {
-                        PaneFrame { pane: Pane::Jobs, closable, jobs::Jobs {} }
+                        PaneFrame {
+                            pane: Pane::Jobs,
+                            closable,
+                            style: "flex: {jobs_flex}",
+                            jobs::Jobs {}
+                        }
                     }
                 }
             }
@@ -258,12 +320,55 @@ fn App() -> Element {
     }
 }
 
+/// A splitter being dragged.
+#[derive(Clone, Copy, PartialEq)]
+struct Drag {
+    splitter: Splitter,
+    /// The area it divides, as it was when the drag started.
+    area: PixelsRect,
+}
+
+/// Something that can be dragged to resize panes or boxes.
+#[derive(Clone, Copy, PartialEq)]
+enum Splitter {
+    /// Between Cameras and the Settings/Jobs column.
+    Side,
+    /// Between Settings and Jobs.
+    Settings,
+    /// A camera's box's bottom right corner, which resizes every camera's
+    /// box.
+    CameraCorner,
+}
+
+/// Starts dragging `splitter`, measuring the `area` it resizes once, when
+/// the drag starts.
+fn start_drag(
+    mut dragging: Signal<Option<Drag>>,
+    splitter: Splitter,
+    area: Option<Rc<MountedData>>,
+) {
+    spawn(async move {
+        let Some(area) = area else {
+            return;
+        };
+        match area.get_client_rect().await {
+            Ok(area) => dragging.set(Some(Drag { splitter, area })),
+            Err(e) => tracing::warn!("measuring the panes: {e}"),
+        }
+    });
+}
+
 #[component]
-fn PaneFrame(pane: Pane, closable: bool, children: Element) -> Element {
+fn PaneFrame(
+    pane: Pane,
+    closable: bool,
+    #[props(default)] style: String,
+    children: Element,
+) -> Element {
     let hub = use_hub();
     let class = format!("pane {}", pane.title().to_lowercase());
     rsx! {
-        section { class,
+        section { class, style,
             div { class: "pane-title",
                 span { "{pane.title()}" }
                 if closable {

@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use protocol::{Directive, MatchManifest, Registration, Segment, Timestamp, api};
+use protocol::{Instructions, MatchManifest, Registration, Segment, Timestamp, api};
 use reqwest::{Body, Client};
 use tokio_util::io::ReaderStream;
 
@@ -79,8 +79,8 @@ impl BaseStation {
         Ok(())
     }
 
-    pub async fn directive(&self) -> Result<Directive> {
-        self.get(&api::directive(&self.camera)).await
+    pub async fn instructions(&self) -> Result<Instructions> {
+        self.get(&api::instructions(&self.camera)).await
     }
 
     pub async fn upload_file(

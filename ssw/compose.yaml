@@ -9,8 +9,6 @@ services:
     restart: unless-stopped
     ports:
       - "7800:7800"
-    volumes:
-      - ssw-data:/data
     environment:
       - SSW_TOKEN
       - ARCTOS_URL
@@ -23,6 +21,3 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-
-volumes:
-  ssw-data:

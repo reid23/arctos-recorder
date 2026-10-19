@@ -4,8 +4,8 @@
 //! |---|---|---|---|
 //! | GET  | [`TIME`] | | [`Timestamp`](crate::Timestamp) |
 //! | PUT  | [`camera`] | [`Registration`](crate::Registration) | 204 |
-//! | GET  | [`directive`] | | [`Directive`](crate::Directive) |
-//! | GET  | [`preview`] | WebSocket of [`PreviewFrame`](crate::PreviewFrame)s | |
+//! | GET  | [`instructions`] | | [`Instructions`](crate::Instructions) |
+//! | GET  | [`preview`] | WebSocket of [`PreviewMessage`](crate::PreviewMessage)s | |
 //! | PUT  | [`recording_file`] | raw file contents | 204 |
 //! | PUT  | [`recording`] | [`MatchManifest`](crate::MatchManifest) | 204 once stored |
 //!
@@ -36,8 +36,8 @@ pub fn camera(camera: &str) -> String {
     format!("/api/cameras/{camera}")
 }
 
-pub fn directive(camera: &str) -> String {
-    format!("/api/cameras/{camera}/directive")
+pub fn instructions(camera: &str) -> String {
+    format!("/api/cameras/{camera}/instructions")
 }
 
 pub fn preview(camera: &str) -> String {

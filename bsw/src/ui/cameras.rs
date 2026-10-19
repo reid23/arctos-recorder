@@ -1,14 +1,13 @@
-use dioxus::prelude::*;
-use protocol::Directive;
+use std::rc::Rc;
 
-use super::{arctos_url, use_hub, use_watch};
-use crate::hub::FieldStatus;
+use dioxus::prelude::*;
+use protocol::{DEFAULT_AUDIO_DEVICE, Directive};
+
+use super::{Drag, Splitter, arctos_url, start_drag, use_hub, use_watch};
+use crate::hub::{Calibration, FieldStatus};
 use crate::server::Feed;
 use crate::settings::{Align, Overlay, Stitching};
-
-/// Size the scoreboard page is laid out at before being scaled to fit.
-/// Wide enough for the between-matches layout with long team names.
-const SCOREBOARD_SIZE: (f64, f64) = (860.0, 200.0);
+use stitching::overlay::PAGE_SIZE;
 
 #[component]
 pub fn Cameras() -> Element {
@@ -38,9 +37,15 @@ fn Camera(id: String) -> Element {
     let settings = use_watch(|hub| &hub.settings);
     let fields = use_watch(|hub| &hub.fields);
     let arctos_fields = use_watch(|hub| &hub.arctos_fields);
+    let calibrations = use_watch(|hub| &hub.calibrations);
     let mut view_width = use_signal(|| 0.0);
+    let mut card = use_signal(|| None::<Rc<MountedData>>);
+    let dragging = use_context::<Signal<Option<Drag>>>();
 
-    let address = cameras.read().get(&id).map(|s| s.address);
+    let status = cameras.read().get(&id).cloned();
+    let address = status.as_ref().map(|s| s.address);
+    let hearing_audio = status.as_ref().is_some_and(|s| s.hearing_audio);
+    let audio_devices = status.map(|s| s.audio_devices).unwrap_or_default();
     let settings = settings.read();
     let camera = settings.cameras.get(&id).cloned().unwrap_or_default();
     let field_status = camera
@@ -48,16 +53,12 @@ fn Camera(id: String) -> Element {
         .as_ref()
         .and_then(|f| fields.read().get(f).cloned());
     let available_fields = arctos_fields.read().clone().unwrap_or_default();
+    // Stitching locally draws the overlay onto the preview itself.
     let scoreboard = camera
         .field
         .as_ref()
-        .filter(|_| settings.overlay.enabled)
-        .map(|field| {
-            arctos_url(
-                &arctos::scoreboard_path(&settings.arctos.tournament, field),
-                settings.overlay.vertical,
-            )
-        });
+        .filter(|_| settings.overlay.enabled && settings.stitching == Stitching::Cloud)
+        .map(|field| arctos_url(&arctos::scoreboard_path(&settings.arctos.tournament, field)));
     let overlay_style = overlay_style(&settings.overlay, view_width());
 
     let set_field = {
@@ -74,9 +75,35 @@ fn Camera(id: String) -> Element {
             hub.update_settings(|s| s.cameras.entry(id.clone()).or_default().stream_url = url);
         }
     };
+    let swap_sides = {
+        let (hub, id) = (hub.clone(), id.clone());
+        move |_| {
+            hub.update_settings(|s| {
+                let camera = s.cameras.entry(id.clone()).or_default();
+                camera.swap_sides = !camera.swap_sides;
+            })
+        }
+    };
+    let set_audio_device = {
+        let (hub, id) = (hub.clone(), id.clone());
+        move |e: FormEvent| {
+            let device = Some(e.value()).filter(|d| d != DEFAULT_AUDIO_DEVICE);
+            hub.update_settings(|s| s.cameras.entry(id.clone()).or_default().audio_device = device);
+        }
+    };
+    let calibrate = {
+        let (hub, id) = (hub.clone(), id.clone());
+        move |_| hub.calibrate(&id)
+    };
+    let use_camera_calibration = {
+        let (hub, id) = (hub.clone(), id.clone());
+        move |_| hub.use_camera_calibration(&id)
+    };
+    let calibration_status = calibrations.read().get(&id).cloned();
+    let calibrating = calibration_status == Some(Calibration::Running);
 
     rsx! {
-        div { class: "camera",
+        div { class: "camera", onmounted: move |e| card.set(Some(e.data())),
             div { class: "camera-header",
                 b { "{id}" }
                 if let Some(address) = address {
@@ -129,18 +156,71 @@ fn Camera(id: String) -> Element {
                         r#type: "text",
                         placeholder: "rtmp://a.rtmp.youtube.com/live2/…",
                         value: camera.stream_url.clone().unwrap_or_default(),
+                        disabled: !settings.workflow.live_stream,
+                        title: if !settings.workflow.live_stream { "Live streaming is off in the settings" },
                         onchange: set_stream_url,
                     }
                 }
+                div { class: "camera-controls",
+                    button {
+                        title: "Show the left camera's feed on the right and vice versa",
+                        onclick: swap_sides,
+                        "Swap sides"
+                    }
+                    label {
+                        "Microphone "
+                        select { onchange: set_audio_device,
+                            option {
+                                value: DEFAULT_AUDIO_DEVICE,
+                                selected: camera.audio_device.is_none(),
+                                "ALSA default"
+                            }
+                            for device in audio_devices {
+                                option {
+                                    selected: camera.audio_device.as_ref() == Some(&device.name),
+                                    value: "{device.name}",
+                                    "{device.description}"
+                                }
+                            }
+                        }
+                    }
+                    if !hearing_audio {
+                        span { class: "error", "No audio" }
+                    }
+                    button {
+                        disabled: calibrating,
+                        title: "Find how the cameras are pointed from what they see now",
+                        onclick: calibrate,
+                        if calibrating { "Calibrating…" } else { "Calibrate" }
+                    }
+                    if camera.calibration.is_some() && !calibrating {
+                        button { onclick: use_camera_calibration, "Use camera's calibration" }
+                    }
+                    match calibration_status {
+                        Some(Calibration::Done(confidence)) => rsx! {
+                            span { class: "muted", "Calibrated ({confidence * 100.0:.0}% confident)" }
+                        },
+                        Some(Calibration::Failed(error)) => rsx! {
+                            span { class: "error", title: "{error}", "Calibration failed" }
+                        },
+                        _ => rsx! {},
+                    }
+                }
+            }
+            div {
+                class: "resize-corner",
+                title: "Drag to resize the cameras",
+                onmousedown: move |_| start_drag(dragging, Splitter::CameraCorner, card()),
             }
         }
     }
 }
 
-/// Places the scoreboard page, laid out at [`SCOREBOARD_SIZE`], over a
-/// `view_width` wide view.
+/// Places the scoreboard page over a `view_width` wide view the way it is
+/// drawn onto the video.
 fn overlay_style(overlay: &Overlay, view_width: f64) -> String {
-    let scale = view_width * overlay.width / 100.0 / SCOREBOARD_SIZE.0;
+    let (width, height) = PAGE_SIZE;
+    let scale = view_width * overlay.width / 100.0 / width as f64;
     let place = |align: Align, offset: f64, [start, end]: [&'static str; 2]| match align {
         Align::Start => (format!("{start}: {offset}%"), start, "0"),
         Align::Center => (format!("{start}: calc(50% + {offset}%)"), "center", "-50%"),
@@ -148,7 +228,6 @@ fn overlay_style(overlay: &Overlay, view_width: f64) -> String {
     };
     let (x, x_origin, x_shift) = place(overlay.horizontal, overlay.x, ["left", "right"]);
     let (y, y_origin, y_shift) = place(overlay.vertical, overlay.y, ["top", "bottom"]);
-    let (width, height) = SCOREBOARD_SIZE;
     format!(
         "{x}; {y}; width: {width}px; height: {height}px; \
          transform-origin: {x_origin} {y_origin}; \

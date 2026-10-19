@@ -1,9 +1,10 @@
 //! HTTP server for the cameras' API (see [`protocol::api`]) and the live
-//! MJPEG feeds shown in the UI.
+//! feeds shown in the UI and restreamed.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use arctos::timestamp;
@@ -15,16 +16,17 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use chrono::Utc;
 use futures_util::{Stream, StreamExt};
 use protocol::{
-    AUDIO_FILE, Directive, LEFT_FILE, MatchManifest, PreviewFrame, RIGHT_FILE, Registration, Side,
-    Timestamp, api,
+    AUDIO_FILE, Instructions, LEFT_FILE, MatchManifest, PreviewFrame, PreviewMessage, RIGHT_FILE,
+    Registration, Side, Timestamp, api, rig,
 };
 use stitching::MatchCalibration;
 use stitching::recording::RecordingKey;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::WatchStream;
 
 use crate::hub::Hub;
@@ -35,7 +37,7 @@ pub async fn serve(hub: Arc<Hub>) -> Result<()> {
     let app = Router::new()
         .route(api::TIME, get(time))
         .route("/api/cameras/{camera}", put(register))
-        .route("/api/cameras/{camera}/directive", get(directive))
+        .route("/api/cameras/{camera}/instructions", get(instructions))
         .route("/api/cameras/{camera}/preview", get(preview))
         .route(
             "/api/cameras/{camera}/recordings/{match_id}",
@@ -72,15 +74,20 @@ async fn register(
     let calibration: MatchCalibration =
         serde_json::from_value(registration.calibration).map_err(bad_request)?;
     calibration.validate().map_err(bad_request)?;
-    hub.register(&camera, address.ip(), calibration);
+    hub.register(
+        &camera,
+        address.ip(),
+        calibration,
+        registration.audio_devices,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn directive(
+async fn instructions(
     State(hub): State<Arc<Hub>>,
     Path(camera): Path<String>,
-) -> Result<Json<Directive>, StatusCode> {
-    hub.directive(&camera)
+) -> Result<Json<Instructions>, StatusCode> {
+    hub.instructions(&camera)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -93,10 +100,23 @@ async fn preview(
     let link = hub.link(&camera).ok_or(StatusCode::NOT_FOUND)?;
     Ok(upgrade.on_upgrade(move |mut socket| async move {
         while let Some(Ok(message)) = socket.recv().await {
-            if let Message::Binary(message) = message
-                && let Some(frame) = PreviewFrame::decode(message)
-            {
-                link.previews[frame.side.index()].send_replace(Some(frame.jpeg));
+            let Message::Binary(message) = message else {
+                continue;
+            };
+            match PreviewMessage::decode(message) {
+                Some(PreviewMessage::Frame(PreviewFrame { side, jpeg })) => {
+                    let side = if hub.settings.borrow().swaps_sides(&camera) {
+                        side.opposite()
+                    } else {
+                        side
+                    };
+                    link.previews[side.index()].send_replace(Some(jpeg));
+                }
+                Some(PreviewMessage::Audio(pcm)) => {
+                    *link.last_audio.lock().unwrap() = Some(Instant::now());
+                    let _ = link.audio.send(pcm);
+                }
+                None => {}
             }
         }
     }))
@@ -112,6 +132,13 @@ async fn upload_file(
     if ![LEFT_FILE, RIGHT_FILE, AUDIO_FILE].contains(&file.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("unexpected file {file}")));
     }
+    let side = Side::BOTH.into_iter().find(|side| side.file_name() == file);
+    let file = match side {
+        Some(side) if hub.settings.borrow().swaps_sides(&camera) => {
+            side.opposite().file_name().to_owned()
+        }
+        _ => file,
+    };
     let dir = hub
         .paths
         .recording(&RecordingKey { match_id, camera })
@@ -162,6 +189,8 @@ pub enum Feed {
     Left,
     Right,
     Panorama,
+    /// The microphone, as in [`protocol::AUDIO_FILE`], in real time.
+    Audio,
 }
 
 impl Feed {
@@ -170,18 +199,34 @@ impl Feed {
             Feed::Left => "left",
             Feed::Right => "right",
             Feed::Panorama => "panorama",
+            Feed::Audio => "audio",
         };
         format!("http://127.0.0.1:{}/live/{camera}/{feed}", api::PORT)
     }
 }
 
-/// Serves a feed as `multipart/x-mixed-replace` JPEGs, which `<img>` plays.
+/// Audio sent per tick of [`Feed::Audio`].
+const AUDIO_TICK: Duration = Duration::from_millis(20);
+/// Audio held back to smooth out the network.
+const AUDIO_JITTER_BUFFER: Duration = Duration::from_millis(100);
+/// Most audio held back; beyond it, the oldest is dropped to catch up.
+const AUDIO_MAX_BUFFER: Duration = Duration::from_millis(500);
+
+fn pcm_bytes(duration: Duration) -> usize {
+    let samples = duration.as_micros() as usize * rig::AUDIO_SAMPLE_RATE as usize / 1_000_000;
+    samples * size_of::<i16>()
+}
+
+/// Serves a feed: video as `multipart/x-mixed-replace` JPEGs, which `<img>`
+/// plays, and audio as a steady stream of PCM with silence where the
+/// microphone's audio is missing.
 async fn live(
     State(hub): State<Arc<Hub>>,
     Path((camera, feed)): Path<(String, Feed)>,
 ) -> Result<Response, StatusCode> {
     let link = hub.link(&camera).ok_or(StatusCode::NOT_FOUND)?;
     let jpegs: std::pin::Pin<Box<dyn Stream<Item = Bytes> + Send>> = match feed {
+        Feed::Audio => return Ok(paced_audio(link.audio.subscribe()).into_response()),
         Feed::Left | Feed::Right => {
             let side = if feed == Feed::Left {
                 Side::Left
@@ -216,6 +261,38 @@ async fn live(
         Body::from_stream(parts),
     )
         .into_response())
+}
+
+fn paced_audio(mut audio: broadcast::Receiver<Bytes>) -> Body {
+    let mut ticker = tokio::time::interval(AUDIO_TICK);
+    let mut buffered = BytesMut::new();
+    let mut playing = false;
+    let ticks =
+        futures_util::stream::poll_fn(move |context| ticker.poll_tick(context).map(|_| Some(())));
+    Body::from_stream(ticks.map(move |()| {
+        loop {
+            match audio.try_recv() {
+                Ok(pcm) => buffered.extend_from_slice(&pcm),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        let excess = buffered.len().saturating_sub(pcm_bytes(AUDIO_MAX_BUFFER));
+        buffered.advance(excess);
+        playing = if playing {
+            !buffered.is_empty()
+        } else {
+            buffered.len() >= pcm_bytes(AUDIO_JITTER_BUFFER)
+        };
+        let tick = pcm_bytes(AUDIO_TICK);
+        let mut chunk = if playing {
+            buffered.split_to(tick.min(buffered.len()))
+        } else {
+            BytesMut::new()
+        };
+        chunk.resize(tick, 0);
+        Ok::<_, Infallible>(chunk.freeze())
+    }))
 }
 
 fn check_id(id: &str) -> ApiResult<()> {

@@ -53,7 +53,9 @@ pub struct AudioChunk {
 pub struct Recorder {
     /// Each match is recorded into `root/<match id>/`.
     pub root: PathBuf,
-    pub audio: bool,
+    /// Whether the microphone is being captured; matches that start while
+    /// it is get an audio track.
+    pub audio: Arc<AtomicBool>,
     /// Tells the cameras to produce full-resolution frames.
     pub recording: Arc<AtomicBool>,
     /// Woken when a finished match is ready to upload.
@@ -131,7 +133,7 @@ impl State {
                             match_id,
                             play,
                             dir,
-                            audio: self.config.audio,
+                            audio: self.config.audio.load(Ordering::Relaxed),
                             segments: Vec::new(),
                             open: None,
                         });

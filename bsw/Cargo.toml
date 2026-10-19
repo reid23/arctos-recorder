@@ -27,3 +27,4 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 turbojpeg.workspace = true
+webbrowser = "1"

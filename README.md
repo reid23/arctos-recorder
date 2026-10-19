@@ -16,7 +16,8 @@ The workspace has these crates:
 - `csw`: the camera software. Linux/libcamera only, so it is built on the
   Pi and is not a default workspace member.
 - `bsw`: the base station desktop app (Dioxus). Needs `ffmpeg` on the
-  `PATH`, and a GPU when stitching locally.
+  `PATH`, a GPU when stitching locally, and Chromium for the live
+  scoreboard overlay.
 - `ssw`: the cloud stitching server, run as a Docker container on a GPU
   server (see `ssw/Dockerfile`).
 
@@ -36,14 +37,33 @@ just csw-logs     # follow its logs
 just ssw-image    # build the cloud stitching server's Docker image
 ```
 
-In the app's Settings, enter the tournament slug and an organizer
-account. Cameras show up under Cameras while they are on the network;
-assign each a field and it records that field's matches. When a match
-ends the camera uploads its recording, and the base station stitches it
-(or has the cloud server stitch it) and uploads it to the match on
-Arctos (see Jobs). The recording is deleted from the base station only
-once the video is on Arctos. Each camera's stitched live preview can be
-restreamed to an RTMP URL such as YouTube Live's.
+In the app's Settings, sign in with Arctos (as an organizer of the
+tournament) and enter the tournament slug. Cameras show up under Cameras
+while they are on the network; assign each a field and it records that
+field's matches. When a match ends the camera uploads its recording, and
+the base station stitches it (or has the cloud server stitch it) and
+uploads it to the match on Arctos (see Jobs). The recording is deleted
+from the base station only once the video is on Arctos. Each camera's
+stitched live preview can be restreamed to an RTMP URL such as YouTube
+Live's.
+
+Under Workflow in the Settings:
+
+- **Live stream** off stops all restreaming.
+- **Stitch later** keeps recordings on the base station until you stitch
+  them (or send them to the cloud server) from the Jobs pane.
+- **Upload later** keeps stitched videos until you upload them from the
+  Jobs pane.
+
+The cloud server uploads what it stitches, so when stitching in the cloud
+the two are one option, **Stitch and upload later**.
+
+The scoreboard overlay is drawn onto the stitched videos and live
+previews wherever they are stitched. Recordings use Arctos's renderings
+of each state of the match's scoreboard; live previews use screenshots
+of the live scoreboard page taken by headless Chromium (`$CHROMIUM`, or
+`chromium`/`google-chrome` on the `PATH`; extra flags in
+`$CHROMIUM_FLAGS`).
 
 bsw and ssw talk to <https://events.californiajugger.org> unless these
 are set:
@@ -53,6 +73,12 @@ are set:
 | `ARCTOS_URL` | Another Arctos server, e.g. `http://127.0.0.1:5000` |
 | `ARCTOS_CF_ACCESS_CLIENT_ID` | Cloudflare Access service token id, for servers behind Cloudflare One |
 | `ARCTOS_CF_ACCESS_CLIENT_SECRET` | ... and its secret |
+| `ARCTOS_CLIENT_ID` | bsw's OAuth client id on that server (defaults to the one it was built with) |
+
+To sign in, bsw must be registered on the Arctos server (Developers,
+then "Your apps") as a public app with the redirect URI
+`http://127.0.0.1/callback`. Build it with `ARCTOS_CLIENT_ID` set to the
+app's client id to make that the default.
 
 ### Cloud stitching
 
@@ -64,10 +90,12 @@ SSW_TOKEN=<secret> docker compose -f ssw/compose.yaml up -d --build
 
 Then, in bsw's Settings, choose "In the cloud" and enter the server URL
 (`http://<host>:7800`) and the token. Recordings are then sent to the
-server, which stitches them, uploads them to Arctos with the organizer
-account from bsw, and deletes them. Each camera's previews are forwarded
-to the server too, which stitches them and restreams them to the
-camera's RTMP URL. The server keeps its data in the `/data` volume.
+server, which stitches them, uploads them to Arctos, and deletes them.
+The server never sees your Arctos sign-in: bsw hands it short-lived
+access tokens, which it only keeps in memory. Each camera's previews are
+forwarded to the server too, which stitches them and restreams them to
+the camera's RTMP URL. Nothing on the server needs to persist; bsw sends
+again any job the server has lost.
 
 ### Calibration and cooling
 

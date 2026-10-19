@@ -1,8 +1,11 @@
 //! Stitching shared by the base station (local stitching) and the cloud
 //! server (cloud stitching).
 
+pub mod browser;
+pub mod calibrate;
 pub mod cloud;
 pub mod live;
+pub mod overlay;
 pub mod recording;
 pub mod restream;
 
@@ -17,6 +20,10 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "state", content = "detail", rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
+    /// Saved to be stitched when the user says so.
+    StitchLater,
+    /// Stitched and saved to be uploaded when the user says so.
+    UploadLater,
     /// Sending the recording to the cloud server, progress in `[0, 1]`.
     Sending(f32),
     Stitching(f32),

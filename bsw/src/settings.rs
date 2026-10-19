@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
-use arctos::Credentials;
 use serde::{Deserialize, Serialize};
+use stitching::overlay::LiveOverlay;
+pub use stitching::overlay::{Align, Overlay};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -13,6 +14,7 @@ pub struct Settings {
     pub arctos: ArctosSettings,
     pub stitching: Stitching,
     pub cloud: CloudSettings,
+    pub workflow: Workflow,
     pub overlay: Overlay,
     pub panes: Panes,
     /// By camera id.
@@ -24,9 +26,6 @@ pub struct Settings {
 pub struct ArctosSettings {
     /// The tournament's URL slug.
     pub tournament: String,
-    /// A tournament organizer account, used to upload footage.
-    #[serde(flatten)]
-    pub credentials: Credentials,
 }
 
 /// Where recordings and live previews are stitched.
@@ -48,55 +47,42 @@ pub struct CloudSettings {
     pub token: String,
 }
 
-/// Placement of the scoreboard overlay on the camera views.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// When recordings are processed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Overlay {
-    pub enabled: bool,
-    pub horizontal: Align,
-    pub vertical: Align,
-    /// Offsets from the anchor, in percent of the view's width/height,
-    /// towards the center.
-    pub x: f64,
-    pub y: f64,
-    /// In percent of the view's width.
-    pub width: f64,
+pub struct Workflow {
+    /// Restream the cameras' live previews to their stream URLs.
+    pub live_stream: bool,
+    /// Keep recordings to be stitched when the user says so.
+    pub stitch_later: bool,
+    /// Keep stitched videos to be uploaded when the user says so.
+    pub upload_later: bool,
 }
 
-impl Default for Overlay {
+impl Default for Workflow {
     fn default() -> Self {
-        Overlay {
-            enabled: true,
-            horizontal: Align::Start,
-            vertical: Align::Start,
-            x: 2.0,
-            y: 3.0,
-            width: 35.0,
+        Workflow {
+            live_stream: true,
+            stitch_later: false,
+            upload_later: false,
         }
     }
 }
 
-/// Left/top, center, or right/bottom.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Align {
-    #[default]
-    Start,
-    Center,
-    End,
-}
-
-impl Align {
-    pub const ALL: [Align; 3] = [Align::Start, Align::Center, Align::End];
-}
-
-/// Which panes of the main window are open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Which panes of the main window are open, and their sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Panes {
     pub cameras: bool,
     pub jobs: bool,
     pub settings: bool,
+    /// Width in pixels of the column holding Settings and Jobs, next to
+    /// Cameras.
+    pub side_width: f64,
+    /// Settings' share of that column's height, when Jobs is open too.
+    pub settings_share: f64,
+    /// Width in pixels of each camera's box in Cameras.
+    pub camera_width: f64,
 }
 
 impl Default for Panes {
@@ -105,6 +91,9 @@ impl Default for Panes {
             cameras: true,
             jobs: false,
             settings: false,
+            side_width: 380.0,
+            settings_share: 0.5,
+            camera_width: 480.0,
         }
     }
 }
@@ -116,6 +105,13 @@ pub struct CameraSettings {
     pub field: Option<String>,
     /// RTMP URL to restream the stitched live preview to.
     pub stream_url: Option<String>,
+    /// Whether the camera's left and right feeds are the other way round.
+    pub swap_sides: bool,
+    /// ALSA PCM name of the microphone; `None` for the ALSA default.
+    pub audio_device: Option<String>,
+    /// A `reco` `MatchCalibration` found with the Calibrate button, used
+    /// instead of the one the camera sends.
+    pub calibration: Option<serde_json::Value>,
 }
 
 impl Settings {
@@ -136,11 +132,45 @@ impl Settings {
         self.cameras.values().filter_map(|c| c.field.as_deref())
     }
 
+    /// Where to restream a camera's live preview, if anywhere.
     pub fn stream_url(&self, camera: &str) -> Option<&str> {
+        if !self.workflow.live_stream {
+            return None;
+        }
         self.cameras
             .get(camera)?
             .stream_url
             .as_deref()
             .filter(|url| !url.is_empty())
+    }
+
+    pub fn swaps_sides(&self, camera: &str) -> bool {
+        self.cameras.get(camera).is_some_and(|c| c.swap_sides)
+    }
+
+    /// ALSA PCM name of the microphone `camera` should capture.
+    pub fn audio_device(&self, camera: &str) -> &str {
+        self.cameras
+            .get(camera)
+            .and_then(|c| c.audio_device.as_deref())
+            .unwrap_or(protocol::DEFAULT_AUDIO_DEVICE)
+    }
+
+    /// The scoreboard to show over a camera's live preview, if any.
+    pub fn live_overlay(&self, camera: &str) -> Option<LiveOverlay> {
+        Some(LiveOverlay {
+            tournament: self.arctos.tournament.clone(),
+            field: self.cameras.get(camera)?.field.clone()?,
+            placement: self.overlay.clone(),
+        })
+        .filter(|_| self.overlay.enabled)
+    }
+
+    /// Whether recordings wait to be stitched. Sending a recording to the
+    /// cloud server gets it uploaded too, so that waits along with
+    /// uploading.
+    pub fn stitches_later(&self) -> bool {
+        self.workflow.stitch_later
+            || (self.stitching == Stitching::Cloud && self.workflow.upload_later)
     }
 }

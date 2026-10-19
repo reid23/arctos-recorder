@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Result;
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
-use reqwest::{Body, Client, RequestBuilder};
+use reqwest::{Body, Client, RequestBuilder, StatusCode};
 use stitching::cloud::{self, JobRequest, JobState};
 use stitching::recording::RecordingKey;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -40,14 +40,25 @@ impl Cloud {
             .await?)
     }
 
-    pub async fn job(&self, key: &RecordingKey) -> Result<JobState> {
-        Ok(self
+    /// The job's state; `None` if the server doesn't know about it.
+    pub async fn job(&self, key: &RecordingKey) -> Result<Option<JobState>> {
+        let response = self
             .request(self.http.get(self.endpoint(&cloud::job(key))))
             .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(response.error_for_status()?.json().await?))
+    }
+
+    pub async fn put_token(&self, key: &RecordingKey, access_token: &str) -> Result<()> {
+        self.request(self.http.put(self.endpoint(&cloud::token(key))))
+            .body(access_token.to_owned())
+            .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .error_for_status()?;
+        Ok(())
     }
 
     /// Uploads a file of a recording, calling `sent` with the number of bytes

@@ -1,16 +1,15 @@
 //! Polls the Arctos scoreboard of every field that has a camera and turns it
 //! into recording directives.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use futures_util::future::join_all;
-use protocol::{Directive, Span, Timestamp};
+use protocol::Directive;
 use tokio::time::MissedTickBehavior;
 
-use arctos::{Scoreboard, timestamp};
+use arctos::Scoreboard;
 
 use crate::hub::{FieldStatus, Hub};
 
@@ -20,19 +19,16 @@ const FIELD_LIST_POLL: Duration = Duration::from_secs(30);
 pub async fn run(hub: Arc<Hub>) {
     tokio::spawn(poll_field_list(hub.clone()));
 
-    // When each match without per-point times was first seen in progress.
-    let mut first_seen: HashMap<String, Timestamp> = HashMap::new();
     let mut ticker = tokio::time::interval(POLL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
         let settings = hub.settings.borrow().clone();
         let fields: BTreeSet<&str> = settings.fields().collect();
-        let scoreboards = join_all(
-            fields
-                .iter()
-                .map(|field| hub.arctos.scoreboard(&settings.arctos.tournament, field)),
-        )
+        let scoreboards = join_all(fields.iter().map(|field| {
+            hub.arctos
+                .scoreboard(&settings.arctos.tournament, field, hub.account.as_ref())
+        }))
         .await;
 
         let previous = hub.fields.borrow().clone();
@@ -40,13 +36,13 @@ pub async fn run(hub: Arc<Hub>) {
         for (field, scoreboard) in fields.into_iter().zip(scoreboards) {
             let status = match scoreboard {
                 Ok(scoreboard) => {
-                    let match_title = scoreboard.match_id.as_ref().map(|id| {
+                    let match_title = scoreboard.as_ref().map(|scoreboard| {
                         let title = scoreboard.title();
-                        hub.remember_match_title(id, title.clone());
+                        hub.remember_match_title(&scoreboard.id, title.clone());
                         title
                     });
                     FieldStatus {
-                        directive: directive(&scoreboard, &mut first_seen),
+                        directive: directive(scoreboard.as_ref()),
                         match_title,
                         error: None,
                     }
@@ -70,43 +66,39 @@ pub async fn run(hub: Arc<Hub>) {
     }
 }
 
-fn directive(scoreboard: &Scoreboard, first_seen: &mut HashMap<String, Timestamp>) -> Directive {
-    let Some(match_id) = scoreboard
-        .match_id
-        .clone()
-        .filter(|_| scoreboard.has_active_match)
-    else {
-        return Directive::Idle;
-    };
-    let play = match &scoreboard.points_for_stones {
-        Some(points) => points.iter().map(|point| point.span()).collect(),
-        // Arctos only reports point times for stones matches, so other
-        // matches are recorded in full.
-        None => {
-            let start = *first_seen
-                .entry(match_id.clone())
-                .or_insert_with(|| timestamp(Utc::now()));
-            vec![Span { start, end: None }]
-        }
-    };
-    Directive::Record { match_id, play }
+fn directive(scoreboard: Option<&Scoreboard>) -> Directive {
+    match scoreboard {
+        None => Directive::Idle,
+        Some(scoreboard) => Directive::Record {
+            match_id: scoreboard.id.clone(),
+            play: scoreboard.points.iter().map(|point| point.span()).collect(),
+        },
+    }
 }
 
 async fn poll_field_list(hub: Arc<Hub>) {
     let mut settings = hub.settings.subscribe();
+    let mut account = hub.account.status.subscribe();
     loop {
         let arctos = settings.borrow_and_update().arctos.clone();
+        account.mark_unchanged();
         let fields = hub
             .arctos
-            .fields(&arctos.tournament, &arctos.credentials)
+            .fields(&arctos.tournament, hub.account.as_ref())
             .await
             .map_err(|e| format!("{e:#}"));
         hub.arctos_fields.send_modify(|f| *f = fields);
-        // Refresh when the Arctos settings change, or periodically.
+        // Refresh when the Arctos settings or the account change, or
+        // periodically.
         let changed = async {
-            while settings.changed().await.is_ok() {
-                if settings.borrow_and_update().arctos != arctos {
-                    return;
+            loop {
+                tokio::select! {
+                    _ = settings.changed() => {
+                        if settings.borrow_and_update().arctos != arctos {
+                            return;
+                        }
+                    }
+                    _ = account.changed() => return,
                 }
             }
         };
