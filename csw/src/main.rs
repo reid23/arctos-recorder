@@ -1,6 +1,6 @@
 //! csw: the camera software running on each field's Raspberry Pi.
 //!
-//! Registers with the base station, streams low-resolution previews to it,
+//! Registers with the base station, streams previews to it,
 //! records the play of each match on its field, and uploads the recordings
 //! once the match is over.
 
@@ -13,17 +13,21 @@ mod dma;
 mod pairing;
 mod preview;
 mod recorder;
+mod stats;
 mod upload;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
-use protocol::{DEFAULT_AUDIO_DEVICE, Directive, Registration};
+use protocol::{
+    DEFAULT_AUDIO_DEVICE, DEFAULT_PREVIEW_QUALITY, DEFAULT_RECORD_QUALITY, Directive, Focus,
+    Registration, rig,
+};
 use tokio::sync::{Notify, watch};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
@@ -31,6 +35,7 @@ use tracing_subscriber::EnvFilter;
 use crate::base::BaseStation;
 use crate::clock::Clock;
 use crate::recorder::{Input, Recorder};
+use crate::stats::{FrameCounters, Reporter};
 
 const POLL: Duration = Duration::from_secs(1);
 const RESYNC: Duration = Duration::from_secs(300);
@@ -47,7 +52,8 @@ struct Args {
     /// Where recordings are kept until they are uploaded.
     #[arg(long, env = "CSW_DATA_DIR", default_value = "/var/lib/csw")]
     data_dir: PathBuf,
-    /// The rig's stitching calibration (a reco `MatchCalibration` JSON file).
+    /// The rig's calibration (a `stitching::geometry::Calibration` JSON
+    /// file).
     #[arg(
         long,
         env = "CSW_CALIBRATION",
@@ -98,12 +104,24 @@ async fn main() -> Result<()> {
         },
     );
     let (previews, previews_rx) = tokio::sync::mpsc::channel(4);
+    let record_quality = Arc::new(AtomicU8::new(DEFAULT_RECORD_QUALITY));
+    let (preview_size, preview_size_rx) = watch::channel(rig::DEFAULT_PREVIEW_SIZE);
+    let preview_quality = Arc::new(AtomicU8::new(DEFAULT_PREVIEW_QUALITY));
+    let (focus, focus_rx) = watch::channel(None);
+    let (autofocus, autofocus_rx) = watch::channel(None);
+    let counters = Arc::new(FrameCounters::default());
     camera::spawn(
         clock.clone(),
         camera::Outputs {
             recording,
+            record_quality: record_quality.clone(),
+            preview_size: preview_size_rx,
+            preview_quality: preview_quality.clone(),
+            focus: focus_rx,
+            autofocus,
             frames: inputs.clone(),
             previews,
+            counters: counters.clone(),
         },
     );
     tokio::spawn(preview::run(
@@ -115,7 +133,26 @@ async fn main() -> Result<()> {
     ));
     tokio::spawn(upload::run(base.clone(), recordings, uploads));
 
-    follow_instructions(&base, discover, &clock, &calibration, inputs, audio_device).await
+    let controlled = Controlled {
+        recorder: inputs,
+        audio_device,
+        record_quality,
+        preview_size,
+        preview_quality,
+        focus,
+    };
+    let reporter = Reporter::new(counters, autofocus_rx);
+    follow_instructions(&base, discover, &clock, &calibration, controlled, reporter).await
+}
+
+/// What the base station's instructions control.
+struct Controlled {
+    recorder: Sender<Input>,
+    audio_device: watch::Sender<String>,
+    record_quality: Arc<AtomicU8>,
+    preview_size: watch::Sender<(u32, u32)>,
+    preview_quality: Arc<AtomicU8>,
+    focus: watch::Sender<Option<Focus>>,
 }
 
 /// Syncs clocks and registers, retrying until the base station is reachable.
@@ -154,16 +191,17 @@ async fn connect(
     }
 }
 
-/// Polls the base station for what to do and forwards changes to the
-/// recorder and the microphone. If the base station goes away, the last
-/// instructions stay in effect until it is back.
+/// Polls the base station for what to do, telling it how the camera is
+/// doing, and forwards changes to what the instructions control. If the
+/// base station goes away, the last instructions stay in effect until it is
+/// back.
 async fn follow_instructions(
     base: &BaseStation,
     discover: bool,
     clock: &Clock,
     calibration: &serde_json::Value,
-    recorder: Sender<Input>,
-    audio_device: watch::Sender<String>,
+    controlled: Controlled,
+    mut reporter: Reporter,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(POLL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -171,17 +209,29 @@ async fn follow_instructions(
     let mut synced = Instant::now();
     loop {
         ticker.tick().await;
-        match base.instructions().await {
+        match base.instructions(&reporter.stats()).await {
             Ok(instructions) => {
                 if instructions.directive != current {
-                    recorder.send(Input::Directive(instructions.directive.clone()))?;
+                    controlled
+                        .recorder
+                        .send(Input::Directive(instructions.directive.clone()))?;
                     current = instructions.directive;
                 }
-                audio_device.send_if_modified(|device| {
+                controlled.audio_device.send_if_modified(|device| {
                     let changed = *device != instructions.audio_device;
                     *device = instructions.audio_device;
                     changed
                 });
+                controlled
+                    .record_quality
+                    .store(instructions.record_quality.clamp(1, 100), Ordering::Relaxed);
+                if rig::PREVIEW_SIZES.contains(&instructions.preview_size) {
+                    controlled.preview_size.send_replace(instructions.preview_size);
+                }
+                controlled
+                    .preview_quality
+                    .store(instructions.preview_quality.clamp(1, 100), Ordering::Relaxed);
+                controlled.focus.send_replace(Some(instructions.focus));
             }
             Err(e) => {
                 tracing::warn!("lost the base station: {e:#}");

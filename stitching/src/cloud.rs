@@ -16,15 +16,18 @@
 //! - `GET {live}` is a WebSocket for forwarding a camera's live previews to
 //!   be stitched and restreamed. The first message is a text [`LiveConfig`];
 //!   the rest are binary chunks of an MPEG-TS stream of H.264-encoded
-//!   [`StereoYuv`](crate::live::StereoYuv) frames.
+//!   [`StereoYuv`](crate::live::StereoYuv) frames, or text
+//!   [`StitchConfig`]s changing how they are stitched.
 
 use protocol::Segment;
-use reco_core::calibration::MatchCalibration;
 use serde::{Deserialize, Serialize};
 
 use crate::JobStatus;
+use crate::encode::VideoQuality;
+use crate::geometry::StitchConfig;
 use crate::overlay::{LiveOverlay, Overlay};
 use crate::recording::{Recording, RecordingKey};
+use crate::restream::Destination;
 
 pub const PORT: u16 = 7800;
 
@@ -47,6 +50,7 @@ pub fn live(camera: &str) -> String {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobRequest {
     pub recording: Recording,
+    pub quality: VideoQuality,
     /// Where to draw the scoreboard overlay, if at all.
     pub overlay: Option<Overlay>,
 }
@@ -61,8 +65,14 @@ pub struct JobState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LiveConfig {
-    pub calibration: MatchCalibration,
-    /// RTMP URL to restream the stitched preview to.
-    pub stream_url: String,
+    pub stitch: StitchConfig,
+    /// Size of each camera's previews; a change means a new connection.
+    pub preview_size: (u32, u32),
+    /// Size of the stitched preview.
+    pub size: (u32, u32),
+    /// Where to restream the stitched preview.
+    pub destination: Destination,
+    /// Of the restream's video, in megabits a second.
+    pub bitrate: f64,
     pub overlay: Option<LiveOverlay>,
 }

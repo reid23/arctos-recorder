@@ -4,7 +4,7 @@
 //! |---|---|---|---|
 //! | GET  | [`TIME`] | | [`Timestamp`](crate::Timestamp) |
 //! | PUT  | [`camera`] | [`Registration`](crate::Registration) | 204 |
-//! | GET  | [`instructions`] | | [`Instructions`](crate::Instructions) |
+//! | POST | [`instructions`] | [`CameraStats`](crate::CameraStats) | [`Instructions`](crate::Instructions) |
 //! | GET  | [`preview`] | WebSocket of [`PreviewMessage`](crate::PreviewMessage)s | |
 //! | PUT  | [`recording_file`] | raw file contents | 204 |
 //! | PUT  | [`recording`] | [`MatchManifest`](crate::MatchManifest) | 204 once stored |

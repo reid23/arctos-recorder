@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Arctos Recorder</string>
+    <key>CFBundleDisplayName</key>
+    <string>Arctos Recorder</string>
+    <key>CFBundleIdentifier</key>
+    <string>org.californiajugger.arctos-recorder</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleExecutable</key>
+    <string>bsw</string>
+    <key>CFBundleIconFile</key>
+    <string>icon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>@DEPLOYMENT_TARGET@</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Arctos Recorder finds the cameras on the camera network and receives their video.</string>
+    <key>NSAppSleepDisabled</key>
+    <true/>
+</dict>
+</plist>

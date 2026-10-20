@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Arctos Recorder
+Comment=Record, stitch and stream jugger fields' cameras
+Exec=arctos-recorder
+Icon=arctos-recorder
+StartupWMClass=arctos-recorder
+Categories=AudioVideo;Video;
+Terminal=false

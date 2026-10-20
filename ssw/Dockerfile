@@ -14,9 +14,7 @@
 
 FROM rust:1-trixie AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        clang cmake nasm pkg-config \
-        libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev \
-        libavutil-dev libswresample-dev libswscale-dev \
+        cmake nasm pkg-config \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
@@ -31,8 +29,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         chromium fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/ssw /usr/local/bin/
-# Graphics for Vulkan stitching, video for NVENC/NVDEC. Chromium (for the
-# live scoreboard overlay) runs as root, which its sandbox doesn't allow.
+# Graphics for Vulkan stitching, video for NVENC. Chromium (for the live
+# scoreboard overlay) runs as root, which its sandbox doesn't allow.
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=all \
     SSW_DATA_DIR=/data \

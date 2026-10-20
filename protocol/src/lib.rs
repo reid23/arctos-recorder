@@ -17,8 +17,11 @@ pub mod api;
 pub mod rig {
     /// Recording resolution of each camera (full-sensor 2x2 binned IMX708).
     pub const RECORD_SIZE: (u32, u32) = (2304, 1296);
-    /// Live preview resolution of each camera (ISP-scaled, same field of view).
-    pub const PREVIEW_SIZE: (u32, u32) = (1536, 864);
+    /// Live preview resolutions each camera can be told to send: scaled by
+    /// the ISP from the same 16:9 sensor mode, so all with the same field of
+    /// view.
+    pub const PREVIEW_SIZES: [(u32, u32); 4] = [(1280, 720), (1536, 864), (1920, 1080), (2304, 1296)];
+    pub const DEFAULT_PREVIEW_SIZE: (u32, u32) = (1536, 864);
     /// Sensor frame rate.
     pub const FPS: u32 = 56;
     /// Every `PREVIEW_DECIMATION`th sensor frame is sent as a preview frame.
@@ -90,8 +93,8 @@ impl Side {
 /// Sent by a camera when it (re)connects to the base station.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Registration {
-    /// The rig's stitching calibration (a `reco` `MatchCalibration` for
-    /// [`rig::RECORD_SIZE`]). Opaque to the camera.
+    /// The rig's calibration (a `stitching::geometry::Calibration`). Opaque
+    /// to the camera.
     pub calibration: serde_json::Value,
     /// The ALSA capture devices the camera can record audio from.
     pub audio_devices: Vec<AudioDevice>,
@@ -108,13 +111,83 @@ pub struct AudioDevice {
 
 /// The ALSA PCM cameras capture audio from unless told otherwise.
 pub const DEFAULT_AUDIO_DEVICE: &str = "default";
+/// The JPEG quality cameras record at unless told otherwise.
+pub const DEFAULT_RECORD_QUALITY: u8 = 80;
+/// The JPEG quality of the previews unless told otherwise.
+pub const DEFAULT_PREVIEW_QUALITY: u8 = 50;
 
 /// What the base station currently wants a camera to do, polled at 1 Hz.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Instructions {
     pub directive: Directive,
     /// ALSA PCM name of the microphone to capture.
     pub audio_device: String,
+    /// JPEG quality (1 to 100) of the frames recorded.
+    pub record_quality: u8,
+    /// One of [`rig::PREVIEW_SIZES`]. Changing it restarts capturing, so
+    /// the camera waits until it isn't recording.
+    pub preview_size: (u32, u32),
+    /// JPEG quality (1 to 100) of the previews.
+    pub preview_quality: u8,
+    pub focus: Focus,
+}
+
+/// Where a camera's lenses are focused.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum Focus {
+    /// Held at these positions, indexed by [`Side::index`]: libcamera's
+    /// `LensPosition`, which is higher the closer the lens focuses.
+    Fixed { lens_positions: [f32; 2] },
+    /// Found by autofocusing once the camera isn't recording, and reported
+    /// in [`CameraStats::autofocus`]. A request made at another time asks
+    /// again.
+    Auto { requested: Timestamp },
+}
+
+/// How a camera is doing, sent with each poll for its instructions. Each
+/// value is `None` if the camera couldn't tell.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CameraStats {
+    /// Share of the CPU's time in use since the last poll, from 0 to 1.
+    pub cpu: Option<f64>,
+    pub memory: Option<Memory>,
+    /// Of the CPU, in degrees Celsius.
+    pub temperature: Option<f64>,
+    /// Since the camera software started, indexed by [`Side::index`].
+    pub frames: [FrameCounts; 2],
+    /// The last autofocus asked for since the camera software started.
+    pub autofocus: Option<AutofocusOutcome>,
+}
+
+/// Where autofocusing put a camera's lenses.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutofocusOutcome {
+    /// When it was asked for (see [`Focus::Auto`]).
+    pub requested: Timestamp,
+    /// Each lens's position, as in [`Focus::Fixed`]; `None` for one that
+    /// found nothing to focus on.
+    pub lens_positions: [Option<f32>; 2],
+}
+
+/// Bytes of memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Memory {
+    pub used: u64,
+    pub total: u64,
+}
+
+/// Running totals of one camera's frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameCounts {
+    /// Delivered by the sensor.
+    pub captured: u64,
+    /// Missed because every buffer was still being encoded.
+    pub dropped: u64,
+    /// Previews made, including those dropped.
+    pub previews: u64,
+    /// Previews dropped because the base station wasn't keeping up.
+    pub previews_dropped: u64,
 }
 
 /// A stretch of play, e.g. one point. `end` is `None` while it is ongoing.

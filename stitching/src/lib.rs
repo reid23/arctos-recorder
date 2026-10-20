@@ -2,17 +2,20 @@
 //! server (cloud stitching).
 
 pub mod browser;
-pub mod calibrate;
 pub mod cloud;
+pub mod encode;
+pub mod geometry;
+pub mod gpu;
 pub mod live;
+pub mod mjpeg;
 pub mod overlay;
 pub mod recording;
 pub mod restream;
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
-use anyhow::{Result, bail};
-pub use reco_core::calibration::MatchCalibration;
 use serde::{Deserialize, Serialize};
 
 /// Progress of processing a recording.
@@ -32,19 +35,24 @@ pub enum JobStatus {
     Failed(String),
 }
 
-fn ffmpeg() -> Command {
-    let mut command = Command::new("ffmpeg");
-    command.args(["-y", "-nostdin", "-loglevel", "error"]);
-    command
+/// ffmpeg: the one installed alongside this program, if any, else the one
+/// on the `PATH`.
+pub fn ffmpeg_program() -> &'static Path {
+    static PROGRAM: OnceLock<PathBuf> = OnceLock::new();
+    PROGRAM.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|program| {
+                let folder = program.parent()?;
+                Some(folder.join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX)))
+            })
+            .filter(|installed| installed.is_file())
+            .unwrap_or_else(|| PathBuf::from("ffmpeg"))
+    })
 }
 
-fn run_ffmpeg(mut command: Command) -> Result<()> {
-    let output = command.output()?;
-    if !output.status.success() {
-        bail!(
-            "{command:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(())
+fn ffmpeg() -> Command {
+    let mut command = Command::new(ffmpeg_program());
+    command.args(["-y", "-nostdin", "-loglevel", "error"]);
+    command
 }

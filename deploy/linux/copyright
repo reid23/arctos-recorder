@@ -1,0 +1,18 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: arctos-recorder
+
+Files: *
+Copyright: the Arctos Recorder developers
+License: GPL-3.0-only
+ On Debian systems, the full text of the GNU General Public License
+ version 3 can be found in /usr/share/common-licenses/GPL-3.
+
+Files: usr/lib/arctos-recorder/ffmpeg
+Copyright: the FFmpeg developers
+License: GPL-3.0-or-later
+ Built by https://github.com/BtbN/FFmpeg-Builds (release
+ autobuild-2026-07-31-14-10) from FFmpeg n8.1.2-34-g9b6c8969e0, whose
+ source is at https://git.ffmpeg.org/ffmpeg.git, and the libraries listed
+ in that build's scripts. On Debian systems, the full text of the GNU
+ General Public License version 3 can be found in
+ /usr/share/common-licenses/GPL-3.

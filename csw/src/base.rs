@@ -5,11 +5,14 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use protocol::{Instructions, MatchManifest, Registration, Segment, Timestamp, api};
+use protocol::{CameraStats, Instructions, MatchManifest, Registration, Segment, Timestamp, api};
 use reqwest::{Body, Client};
 use tokio_util::io::ReaderStream;
 
 use crate::clock::Clock;
+
+/// For requests answered right away.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct BaseStation {
@@ -79,8 +82,17 @@ impl BaseStation {
         Ok(())
     }
 
-    pub async fn instructions(&self) -> Result<Instructions> {
-        self.get(&api::instructions(&self.camera)).await
+    pub async fn instructions(&self, stats: &CameraStats) -> Result<Instructions> {
+        Ok(self
+            .http
+            .post(self.endpoint(&api::instructions(&self.camera)))
+            .json(stats)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     pub async fn upload_file(
@@ -119,7 +131,7 @@ impl BaseStation {
         Ok(self
             .http
             .get(self.endpoint(path))
-            .timeout(Duration::from_secs(2))
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await?
             .error_for_status()?

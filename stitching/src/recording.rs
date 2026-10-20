@@ -2,30 +2,32 @@
 //!
 //! A recording lives in a directory holding the segment directories sent by
 //! the camera, plus [`RECORDING_FILE`] describing it. It is rendered by
-//! stitching every segment with reco and concatenating the results into
-//! [`VIDEO_FILE`], which is uploaded to Arctos with an anchor at the start of
-//! each segment so viewers can jump to points.
+//! stitching every segment's frames one after another into [`VIDEO_FILE`],
+//! which is uploaded to Arctos with an anchor at the start of each segment
+//! so viewers can jump to points.
 
+use std::fs::File;
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use arctos::{Anchor, Arctos, Footage, OverlayFrame, datetime};
 use chrono::{DateTime, Utc};
-use protocol::{AUDIO_FILE, MatchManifest, Side, rig};
-use reco_core::calibration::MatchCalibration;
-use reco_io::StitchJob;
-use reco_io::output::AudioMode;
+use protocol::{AUDIO_FILE, MatchManifest, Segment, Side, rig};
 use serde::{Deserialize, Serialize};
 
-use crate::overlay::Overlay;
-use crate::{ffmpeg, run_ffmpeg};
+use crate::encode::{self, Encoder, VideoQuality};
+use crate::geometry::StitchConfig;
+use crate::gpu::{Gpu, Output, OverlayImage, Stitcher};
+use crate::mjpeg::{PairDecoder, PairedFiles};
+use crate::overlay::{Overlay, RgbaImage};
 
 pub const RECORDING_FILE: &str = "recording.json";
 pub const VIDEO_FILE: &str = "panorama.mp4";
 const WORK_DIR: &str = "work";
-const OUTPUT_SIZE: (u32, u32) = (1920, 1080);
+/// Frames between progress reports.
+const PROGRESS_INTERVAL: u64 = rig::FPS as u64;
 
 /// Identifies a recording: one camera's footage of one match.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,7 +41,7 @@ pub struct RecordingKey {
 pub struct Recording {
     pub tournament: String,
     pub title: String,
-    pub calibration: MatchCalibration,
+    pub stitch: StitchConfig,
     pub manifest: MatchManifest,
 }
 
@@ -108,6 +110,13 @@ fn remove_dir(dir: &Path) -> Result<()> {
     }
 }
 
+/// The size a recording stitched with `stitch` is rendered at: with as many
+/// pixels per degree as the cameras' recordings have in their middles, or as
+/// big as this machine's encoder takes. Blocks while trying the encoder.
+pub fn output_size(stitch: &StitchConfig) -> Result<(u32, u32)> {
+    encode::largest_size(stitch.aspect_ratio, stitch.native_width(rig::RECORD_SIZE))
+}
+
 /// The scoreboard overlay of a recording's match.
 pub struct OverlayImages {
     pub placement: Overlay,
@@ -116,17 +125,19 @@ pub struct OverlayImages {
 }
 
 impl OverlayImages {
-    /// Fetches the overlay of the recording's match from Arctos.
+    /// Fetches the overlay of the recording's match from Arctos, for a
+    /// `video` sized render.
     pub async fn fetch(
         arctos: &Arctos,
         recording: &Recording,
         placement: &Overlay,
+        video: (u32, u32),
     ) -> Result<Self> {
         let frames = arctos
             .scoreboard_overlay(
                 &recording.tournament,
                 &recording.manifest.match_id,
-                placement.image_size(OUTPUT_SIZE),
+                placement.image_size(video),
             )
             .await
             .context("fetching the scoreboard overlay")?;
@@ -137,87 +148,116 @@ impl OverlayImages {
     }
 }
 
-/// Stitches every segment in `dir`, concatenates them and draws the overlay
-/// (if any) into [`VIDEO_FILE`], reporting progress in `[0, 1]`. Blocks for
-/// a long time.
+/// Stitches every segment in `dir` into a `size` [`VIDEO_FILE`], with the
+/// overlay (if any) drawn on top and the audio (if recorded), reporting
+/// progress in `[0, 1]`. Blocks for a long time.
 pub fn render(
     dir: &Path,
     recording: &Recording,
+    size: (u32, u32),
+    quality: VideoQuality,
     overlay: Option<&OverlayImages>,
     progress: Arc<dyn Fn(f32) + Send + Sync>,
 ) -> Result<PathBuf> {
     let work = dir.join(WORK_DIR);
     std::fs::create_dir_all(&work)?;
     let segments = &recording.manifest.segments;
-    let total_frames: u32 = segments.iter().map(|s| s.frames).sum();
-    let mut stitched_frames = 0;
-    let mut parts = Vec::new();
+    let audio = if recording.manifest.audio {
+        let audio = work.join(AUDIO_FILE);
+        join_audio(dir, segments, &audio).context("joining the audio")?;
+        Some(audio)
+    } else {
+        None
+    };
+    let overlay_images: Vec<RgbaImage> = overlay
+        .map_or(&[][..], |overlay| &overlay.frames)
+        .iter()
+        .map(|frame| RgbaImage::decode_png(&frame.png))
+        .collect::<Result<_>>()
+        .context("decoding the scoreboard overlay")?;
+    let mut overlay_changes = overlay
+        .map(|overlay| overlay_schedule(recording, overlay))
+        .unwrap_or_default()
+        .into_iter()
+        .peekable();
+    let overlay_position = overlay.map_or((0, 0), |overlay| overlay.placement.position(size));
 
-    for segment in segments {
-        let name = segment.dir_name();
-        let source = dir.join(&name);
-        let [left, right] = Side::BOTH.map(|side| work.join(format!("{name}-{side:?}.mkv")));
-        remux(&source, Side::Left, recording.manifest.audio, &left)?;
-        remux(&source, Side::Right, false, &right)?;
-
-        let part = work.join(format!("{name}.mp4"));
-        let progress = progress.clone();
-        let done = stitched_frames;
-        StitchJob::with_calibration(left, right, recording.calibration.clone(), &part)
-            .resolution(OUTPUT_SIZE.0, OUTPUT_SIZE.1)
-            .audio(if recording.manifest.audio {
-                AudioMode::CopyFrom(0)
-            } else {
-                AudioMode::Disabled
-            })
-            .on_progress(move |p| {
-                progress((done as u64 + p.frames_completed) as f32 / total_frames as f32);
-            })
-            .run(&AtomicBool::new(false))?;
-        stitched_frames += segment.frames;
-        parts.push(part);
-    }
-
+    let gpu = Gpu::shared()?;
+    let mut stitcher = Stitcher::new(&gpu, rig::RECORD_SIZE, size, Output::Video, &recording.stitch)?;
+    tracing::info!(width = size.0, height = size.1, "rendering a recording");
     // Rendered under a temporary name so a partial render never counts as
     // done.
     let partial = work.join(VIDEO_FILE);
-    match overlay {
-        Some(overlay) if !overlay.frames.is_empty() => {
-            let stitched = work.join("stitched.mp4");
-            concat(&parts, &work, &stitched)?;
-            draw_overlay(&stitched, recording, overlay, &work, &partial)?;
+    let mut encoder = Encoder::start(&partial, size, rig::FPS, quality, audio.as_deref())?;
+    let stretches = segments
+        .iter()
+        .map(|segment| {
+            let source = dir.join(segment.dir_name());
+            PairedFiles {
+                files: Side::BOTH.map(|side| source.join(side.file_name())),
+                frames: segment.frames,
+            }
+        })
+        .collect();
+    let mut decoder = PairDecoder::start(stretches, rig::RECORD_SIZE);
+    let frames = decoder.frames();
+    let mut index = 0;
+    while let Some(pair) = decoder.next_pair() {
+        let pair = pair?;
+        while let Some((_, shown)) = overlay_changes.next_if(|&(start, _)| start <= index) {
+            stitcher.set_overlay(shown.map(|shown| OverlayImage {
+                image: &overlay_images[shown],
+                position: overlay_position,
+            }));
         }
-        _ => concat(&parts, &work, &partial)?,
+        let [left, right] = &pair;
+        if let Some(stitched) = stitcher.submit([left.planes(), right.planes()])? {
+            encoder.write(stitched)?;
+        }
+        decoder.recycle(pair);
+        index += 1;
+        if index % PROGRESS_INTERVAL == 0 {
+            progress(index as f32 / frames as f32);
+        }
     }
+    while let Some(stitched) = stitcher.finish()? {
+        encoder.write(stitched)?;
+    }
+    encoder.finish()?;
     let video = dir.join(VIDEO_FILE);
     std::fs::rename(&partial, &video)?;
     std::fs::remove_dir_all(&work)?;
     Ok(video)
 }
 
-/// Draws the scoreboard overlay onto `video`, showing each state of the
-/// scoreboard from when it took effect.
-fn draw_overlay(
-    video: &Path,
-    recording: &Recording,
-    overlay: &OverlayImages,
-    work: &Path,
-    output: &Path,
-) -> Result<()> {
-    let (width, height) = overlay.placement.image_size(OUTPUT_SIZE);
-    let blank = work.join("overlay-blank.png");
-    write_transparent_png(&blank, (width, height))?;
-    let images: Vec<PathBuf> = overlay
-        .frames
-        .iter()
-        .enumerate()
-        .map(|(index, frame)| {
-            let path = work.join(format!("overlay-{index}.png"));
-            std::fs::write(&path, &frame.png)?;
-            Ok(path)
-        })
-        .collect::<Result<_>>()?;
+/// Joins the segments' audio into `output`, each segment's trimmed or
+/// padded with silence to last exactly as long as its frames.
+fn join_audio(dir: &Path, segments: &[Segment], output: &Path) -> Result<()> {
+    const SAMPLE_BYTES: u64 = 2;
+    let mut writer = BufWriter::new(File::create(output)?);
+    let (mut frames, mut written) = (0, 0);
+    for segment in segments {
+        frames += segment.frames as u64;
+        let end = frames * rig::AUDIO_SAMPLE_RATE as u64 / rig::FPS as u64 * SAMPLE_BYTES;
+        let wanted = end - written;
+        let path = dir.join(segment.dir_name()).join(AUDIO_FILE);
+        let copied = match File::open(&path) {
+            Ok(file) => std::io::copy(&mut file.take(wanted), &mut writer)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(segment = segment.dir_name(), "a segment has no audio");
+                0
+            }
+            Err(error) => return Err(error).context(format!("opening {}", path.display())),
+        };
+        std::io::copy(&mut std::io::repeat(0).take(wanted - copied), &mut writer)?;
+        written = end;
+    }
+    writer.flush()?;
+    Ok(())
+}
 
+/// The frame each overlay image starts showing at; `None` shows nothing.
+fn overlay_schedule(recording: &Recording, overlay: &OverlayImages) -> Vec<(u64, Option<usize>)> {
     let segments: Vec<(Anchor, f64)> = recording
         .anchors()
         .into_iter()
@@ -225,36 +265,10 @@ fn draw_overlay(
         .map(|(anchor, segment)| (anchor, segment.duration().as_secs_f64()))
         .collect();
     let effective: Vec<DateTime<Utc>> = overlay.frames.iter().map(|f| f.effective_at).collect();
-    let timeline = overlay_timeline(&segments, &effective);
-    let mut list = String::from("ffconcat version 1.0\n");
-    for (index, (start, shown)) in timeline.iter().enumerate() {
-        let image = shown.map_or(&blank, |shown| &images[shown]);
-        list += &format!("file '{}'\n", image.display());
-        if let Some((next, _)) = timeline.get(index + 1) {
-            list += &format!("duration {:.3}\n", next - start);
-        }
-    }
-    let list_path = work.join("overlay.txt");
-    std::fs::write(&list_path, list)?;
-
-    let (x, y) = overlay.placement.position(OUTPUT_SIZE);
-    let mut command = ffmpeg();
-    command
-        .arg("-i")
-        .arg(video)
-        .args(["-f", "concat", "-safe", "0", "-i"])
-        .arg(&list_path)
-        .args([
-            "-filter_complex",
-            &format!("[0:v][1:v]overlay=x={x}:y={y}:eof_action=repeat[v]"),
-        ])
-        .args(["-map", "[v]", "-map", "0:a?", "-c:a", "copy"])
-        .args([
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-        ])
-        .args(["-movflags", "+faststart"])
-        .arg(output);
-    run_ffmpeg(command)
+    overlay_timeline(&segments, &effective)
+        .into_iter()
+        .map(|(start, shown)| ((start * rig::FPS as f64).round() as u64, shown))
+        .collect()
 }
 
 /// When each overlay frame starts showing in the video, in seconds; `None`
@@ -283,60 +297,38 @@ fn overlay_timeline(
     timeline
 }
 
-fn write_transparent_png(path: &Path, (width, height): (u32, u32)) -> Result<()> {
-    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut encoder = png::Encoder::new(file, width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder
-        .write_header()?
-        .write_image_data(&vec![0; (width * height * 4) as usize])?;
-    Ok(())
-}
-
-/// Wraps one camera's raw JPEG stream (plus the audio) in a Matroska file.
-fn remux(segment: &Path, side: Side, audio: bool, output: &Path) -> Result<()> {
-    let mut command = ffmpeg();
-    command
-        .args(["-f", "mjpeg", "-framerate", &rig::FPS.to_string(), "-i"])
-        .arg(segment.join(side.file_name()));
-    if audio {
-        command
-            .args([
-                "-f",
-                "s16le",
-                "-ar",
-                &rig::AUDIO_SAMPLE_RATE.to_string(),
-                "-ac",
-                "1",
-                "-i",
-            ])
-            .arg(segment.join(AUDIO_FILE))
-            .args(["-c:a", "aac", "-shortest"]);
-    }
-    command.args(["-c:v", "copy"]).arg(output);
-    run_ffmpeg(command)
-}
-
-fn concat(parts: &[PathBuf], work: &Path, output: &Path) -> Result<()> {
-    let list = work.join("parts.txt");
-    let lines: String = parts
-        .iter()
-        .map(|p| format!("file '{}'\n", p.display()))
-        .collect();
-    std::fs::write(&list, lines)?;
-    let mut command = ffmpeg();
-    command
-        .args(["-f", "concat", "-safe", "0", "-i"])
-        .arg(&list)
-        .args(["-c", "copy", "-movflags", "+faststart"])
-        .arg(output);
-    run_ffmpeg(command)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joined_audio_keeps_each_segment_in_time_with_its_frames() {
+        let dir = std::env::temp_dir().join(format!("join-audio-test-{}", std::process::id()));
+        let segment = |start, frames| Segment {
+            start: protocol::Timestamp(start),
+            frames,
+        };
+        // 56 frames last a second: 48000 samples.
+        let segments = [segment(1, 56), segment(2, 28), segment(3, 7)];
+        let write = |segment: &Segment, samples: usize, value: u8| {
+            let path = dir.join(segment.dir_name());
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join(AUDIO_FILE), vec![value; samples * 2]).unwrap();
+        };
+        write(&segments[0], 47_000, 1);
+        write(&segments[1], 30_000, 2);
+        let output = dir.join("joined.pcm");
+        join_audio(&dir, &segments, &output).unwrap();
+        let joined = std::fs::read(&output).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let expected: Vec<u8> = [(47_000, 1), (1_000, 0), (24_000, 2), (6_000, 0)]
+            .into_iter()
+            .flat_map(|(samples, value)| vec![value; samples * 2])
+            .collect();
+        assert_eq!(joined.len(), expected.len());
+        assert!(joined == expected);
+    }
 
     #[test]
     fn overlay_timeline_follows_the_scoreboard_through_segments() {

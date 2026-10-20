@@ -15,15 +15,15 @@ use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use bytes::{Buf, Bytes, BytesMut};
 use chrono::Utc;
 use futures_util::{Stream, StreamExt};
 use protocol::{
-    AUDIO_FILE, Instructions, LEFT_FILE, MatchManifest, PreviewFrame, PreviewMessage, RIGHT_FILE,
-    Registration, Side, Timestamp, api, rig,
+    AUDIO_FILE, CameraStats, Instructions, LEFT_FILE, MatchManifest, PreviewFrame, PreviewMessage,
+    RIGHT_FILE, Registration, Side, Timestamp, api, rig,
 };
-use stitching::MatchCalibration;
+use stitching::geometry::Calibration;
 use stitching::recording::RecordingKey;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
@@ -37,7 +37,7 @@ pub async fn serve(hub: Arc<Hub>) -> Result<()> {
     let app = Router::new()
         .route(api::TIME, get(time))
         .route("/api/cameras/{camera}", put(register))
-        .route("/api/cameras/{camera}/instructions", get(instructions))
+        .route("/api/cameras/{camera}/instructions", post(instructions))
         .route("/api/cameras/{camera}/preview", get(preview))
         .route(
             "/api/cameras/{camera}/recordings/{match_id}",
@@ -71,7 +71,7 @@ async fn register(
     Json(registration): Json<Registration>,
 ) -> ApiResult<StatusCode> {
     check_id(&camera)?;
-    let calibration: MatchCalibration =
+    let calibration: Calibration =
         serde_json::from_value(registration.calibration).map_err(bad_request)?;
     calibration.validate().map_err(bad_request)?;
     hub.register(
@@ -86,8 +86,9 @@ async fn register(
 async fn instructions(
     State(hub): State<Arc<Hub>>,
     Path(camera): Path<String>,
+    Json(stats): Json<CameraStats>,
 ) -> Result<Json<Instructions>, StatusCode> {
-    hub.instructions(&camera)
+    hub.instructions(&camera, &stats)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }

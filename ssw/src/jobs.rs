@@ -16,7 +16,7 @@ use futures_util::future::BoxFuture;
 use protocol::Segment;
 use stitching::JobStatus;
 use stitching::cloud::{JobRequest, JobState};
-use stitching::recording::{OverlayImages, RecordingKey, VIDEO_FILE, render};
+use stitching::recording::{self, OverlayImages, RecordingKey, VIDEO_FILE, render};
 use tokio::sync::{mpsc, watch};
 
 const REQUEST_FILE: &str = "job.json";
@@ -54,7 +54,9 @@ impl Jobs {
                     match_id: match_dir.file_name().to_string_lossy().into_owned(),
                     camera: camera_dir?.file_name().to_string_lossy().into_owned(),
                 };
-                jobs.refresh(&key)?;
+                if let Err(e) = jobs.refresh(&key) {
+                    tracing::warn!("skipping the job {key:?}: {e:#}");
+                }
             }
         }
         Ok((jobs, queue_rx))
@@ -177,9 +179,11 @@ impl Jobs {
         let video = dir.join(VIDEO_FILE);
         if !video.exists() {
             self.set_status(key, JobStatus::Stitching(0.0));
+            let stitch = recording.stitch.clone();
+            let size = tokio::task::spawn_blocking(move || recording::output_size(&stitch)).await??;
             let overlay = match &request.overlay {
                 Some(placement) => {
-                    Some(OverlayImages::fetch(&self.arctos, recording, placement).await?)
+                    Some(OverlayImages::fetch(&self.arctos, recording, placement, size).await?)
                 }
                 None => None,
             };
@@ -187,9 +191,9 @@ impl Jobs {
                 let (jobs, key) = (self.clone(), key.clone());
                 Arc::new(move |p| jobs.set_status(&key, JobStatus::Stitching(p)))
             };
-            let (render_dir, render_recording) = (dir.clone(), recording.clone());
+            let (render_dir, render_recording, quality) = (dir.clone(), recording.clone(), request.quality);
             tokio::task::spawn_blocking(move || {
-                render(&render_dir, &render_recording, overlay.as_ref(), progress)
+                render(&render_dir, &render_recording, size, quality, overlay.as_ref(), progress)
             })
             .await??;
         }

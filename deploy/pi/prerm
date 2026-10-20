@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = remove ]; then
+    systemctl disable csw.service
+    if [ -d /run/systemd/system ]; then
+        systemctl stop csw.service
+    fi
+fi

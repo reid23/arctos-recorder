@@ -18,7 +18,7 @@ use anyhow::{Result, bail};
 use arctos::TokenSource;
 use stitching::JobStatus;
 use stitching::cloud::JobRequest;
-use stitching::recording::{OverlayImages, Recording, RecordingKey, VIDEO_FILE, render};
+use stitching::recording::{self, OverlayImages, Recording, RecordingKey, VIDEO_FILE, render};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::cloud::Cloud;
@@ -130,9 +130,14 @@ async fn stitch(
     recording: &Recording,
 ) -> Result<()> {
     hub.set_job_status(key, JobStatus::Stitching(0.0));
-    let placement = hub.settings.borrow().overlay.clone();
+    let stitch = recording.stitch.clone();
+    let size = tokio::task::spawn_blocking(move || recording::output_size(&stitch)).await??;
+    let (placement, quality) = {
+        let settings = hub.settings.borrow();
+        (settings.overlay.clone(), settings.recording.video_quality)
+    };
     let overlay = if placement.enabled {
-        Some(OverlayImages::fetch(&hub.arctos, recording, &placement).await?)
+        Some(OverlayImages::fetch(&hub.arctos, recording, &placement, size).await?)
     } else {
         None
     };
@@ -141,7 +146,7 @@ async fn stitch(
         Arc::new(move |p| hub.set_job_status(&key, JobStatus::Stitching(p)))
     };
     let (dir, recording) = (dir.to_owned(), recording.clone());
-    tokio::task::spawn_blocking(move || render(&dir, &recording, overlay.as_ref(), progress))
+    tokio::task::spawn_blocking(move || render(&dir, &recording, size, quality, overlay.as_ref(), progress))
         .await??;
     Ok(())
 }
@@ -168,9 +173,13 @@ async fn send_recording(
     recording: &Recording,
 ) -> Result<()> {
     let dir = hub.paths.recording(key);
-    let overlay = hub.settings.borrow().overlay.clone();
+    let (overlay, quality) = {
+        let settings = hub.settings.borrow();
+        (settings.overlay.clone(), settings.recording.video_quality)
+    };
     let request = JobRequest {
         recording: recording.clone(),
+        quality,
         overlay: overlay.enabled.then_some(overlay),
     };
     let state = cloud.put_job(key, &request).await?;
