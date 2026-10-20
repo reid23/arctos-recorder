@@ -1,13 +1,13 @@
 //! Turns the stream of frames into per-match recordings of just the play.
 //!
-//! While a match is on, stereo frames wait in a ring buffer for [`DELAY`]. By
-//! the time a frame leaves the buffer the base station has told us about any
-//! point that started up to [`MARGIN`] after it, so we can decide whether the
-//! frame is within [`MARGIN`] of play. Kept frames are appended to the open
-//! segment and discarding a frame closes it, so each segment covers one
-//! stretch of play. Frames the cameras failed to deliver are filled in by
-//! repeating the previous one, so segments play back in real time at the
-//! rig's frame rate.
+//! While a match is on, stereo frames wait in a ring buffer for as long as
+//! the base station says. That gives it time to tell us about a point
+//! starting shortly after a frame, so a frame leaving the buffer is kept if
+//! it is within the margins the base station sets of any play. Kept frames
+//! are appended to the open segment and discarding a frame closes it, so each
+//! segment covers one stretch of play. Frames the cameras failed to deliver
+//! are filled in by repeating the previous one, so segments play back in
+//! real time at the rig's frame rate.
 
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -20,15 +20,10 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use protocol::{AUDIO_FILE, Directive, MatchManifest, Segment, Side, Span, Timestamp, rig};
-use tokio::sync::Notify;
+use protocol::{AUDIO_FILE, Directive, Margins, MatchManifest, Segment, Side, Span, Timestamp, rig};
+use tokio::sync::{Notify, watch};
 
 use crate::pairing::{Pairer, StereoFrame};
-
-/// How much footage to keep before and after each point.
-const MARGIN: Duration = Duration::from_secs(10);
-/// [`MARGIN`] plus slack for the base station's polling latency.
-const DELAY: Duration = Duration::from_secs(12);
 
 pub const MANIFEST_FILE: &str = "manifest.json";
 
@@ -60,6 +55,10 @@ pub struct Recorder {
     pub recording: Arc<AtomicBool>,
     /// Woken when a finished match is ready to upload.
     pub uploads: Arc<Notify>,
+    /// The footage to keep around each point.
+    pub margins: watch::Receiver<Margins>,
+    /// How long frames wait in the buffer.
+    pub buffer: watch::Receiver<Duration>,
 }
 
 impl Recorder {
@@ -101,7 +100,8 @@ impl State {
                 Input::Frame(frame) if self.session.is_some() => {
                     self.frames.extend(self.pairer.push(frame));
                     if let Some(newest) = self.frames.back() {
-                        self.release_before(newest.timestamp - DELAY)?;
+                        let buffer = *self.config.buffer.borrow();
+                        self.release_before(newest.timestamp - buffer)?;
                     }
                 }
                 Input::Audio(chunk) if self.session.is_some() => self.audio.push_back(chunk),
@@ -150,9 +150,10 @@ impl State {
             .session
             .as_mut()
             .expect("frames are only buffered during a session");
+        let margins = *self.config.margins.borrow();
         while self.frames.front().is_some_and(|f| f.timestamp < cutoff) {
             let frame = self.frames.pop_front().expect("checked non-empty");
-            session.write(frame, &mut self.audio)?;
+            session.write(frame, margins, &mut self.audio)?;
         }
         Ok(())
     }
@@ -204,9 +205,9 @@ struct Session {
 }
 
 impl Session {
-    fn write(&mut self, frame: StereoFrame, audio: &mut VecDeque<AudioChunk>) -> Result<()> {
+    fn write(&mut self, frame: StereoFrame, margins: Margins, audio: &mut VecDeque<AudioChunk>) -> Result<()> {
         let timestamp = frame.timestamp;
-        let keep = self.play.iter().any(|span| span.covers(timestamp, MARGIN));
+        let keep = self.play.iter().any(|span| span.covers(timestamp, margins));
         if keep {
             match &mut self.open {
                 Some(open) => open.append(frame)?,

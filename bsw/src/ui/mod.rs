@@ -2,10 +2,15 @@
 //! changes; all I/O happens in the backend.
 //!
 //! The window is split into panes, opened and closed from the Window menu:
-//! Cameras on the left, Settings and Jobs stacked on the right.
+//! Performance on the far left, then Cameras, then Settings and Jobs
+//! stacked on the right. Cameras are calibrated in windows of their own
+//! (see [`calibration`]).
 
+mod calibration;
 mod cameras;
+mod controls;
 mod jobs;
+mod performance;
 mod settings;
 
 use std::cell::RefCell;
@@ -36,6 +41,7 @@ const MIN_PANE_SIZE: f64 = 200.0;
 /// The narrowest a camera's box can be resized to, in pixels.
 const MIN_CAMERA_WIDTH: f64 = 240.0;
 const ICON: &[u8] = include_bytes!("../../assets/icon.png");
+const BACKGROUND: (u8, u8, u8, u8) = (0xF4, 0xF6, 0xD7, 0xFF);
 /// Custom URL scheme proxying the Arctos web app, so its pages can be shown
 /// in the window (see [`proxy_arctos`]).
 const ARCTOS_SCHEME: &str = "arctos";
@@ -54,11 +60,15 @@ pub fn launch(hub: Arc<Hub>, runtime: Handle) {
         .with_window(window)
         .with_icon(icon)
         .with_menu(menu(hub.settings.borrow().panes))
-        .with_background_color((0xF4, 0xF6, 0xD7, 0xFF))
-        .with_asynchronous_custom_protocol(ARCTOS_SCHEME, proxy_arctos(hub.clone(), runtime));
+        .with_background_color(BACKGROUND)
+        .with_asynchronous_custom_protocol(
+            ARCTOS_SCHEME,
+            proxy_arctos(hub.clone(), runtime.clone()),
+        );
     dioxus::LaunchBuilder::desktop()
         .with_cfg(config)
         .with_context(hub)
+        .with_context(runtime)
         .launch(App);
 }
 
@@ -92,7 +102,6 @@ fn menu(panes: Panes) -> Menu {
     });
     Menu::with_items(&[&file, &edit, &window]).expect("build menu")
 }
-
 /// Serves `arctos://arctos/<path>` from the Arctos server (see
 /// [`arctos_url`]). Loading Arctos pages directly would open them in the
 /// browser (Dioxus sends every http(s) navigation there) and would need the
@@ -136,16 +145,18 @@ enum Pane {
     Cameras,
     Jobs,
     Settings,
+    Performance,
 }
 
 impl Pane {
-    const ALL: [Pane; 3] = [Pane::Cameras, Pane::Jobs, Pane::Settings];
+    const ALL: [Pane; 4] = [Pane::Cameras, Pane::Jobs, Pane::Settings, Pane::Performance];
 
     fn title(self) -> &'static str {
         match self {
             Pane::Cameras => "Cameras",
             Pane::Jobs => "Jobs",
             Pane::Settings => "Settings",
+            Pane::Performance => "Performance",
         }
     }
 
@@ -154,6 +165,7 @@ impl Pane {
             Pane::Cameras => "pane-cameras",
             Pane::Jobs => "pane-jobs",
             Pane::Settings => "pane-settings",
+            Pane::Performance => "pane-performance",
         }
     }
 
@@ -162,6 +174,7 @@ impl Pane {
             Pane::Cameras => &mut panes.cameras,
             Pane::Jobs => &mut panes.jobs,
             Pane::Settings => &mut panes.settings,
+            Pane::Performance => &mut panes.performance,
         }
     }
 
@@ -170,6 +183,7 @@ impl Pane {
             Pane::Cameras => panes.cameras,
             Pane::Jobs => panes.jobs,
             Pane::Settings => panes.settings,
+            Pane::Performance => panes.performance,
         }
     }
 }
@@ -199,6 +213,7 @@ fn set_pane(hub: &Hub, pane: Pane, open: bool) {
 fn App() -> Element {
     let hub = use_hub();
     let settings = use_watch(|hub| &hub.settings);
+    use_drop(calibration::close_all);
     use_muda_event_handler({
         let hub = hub.clone();
         move |event: &MenuEvent| {
@@ -217,6 +232,7 @@ fn App() -> Element {
 
     let panes = resized().unwrap_or(settings.read().panes);
     let closable = open_count(&panes) > 1;
+    let side_open = panes.settings || panes.jobs;
     let both_side_panes = panes.settings && panes.jobs;
     let (settings_flex, jobs_flex) = if both_side_panes {
         (panes.settings_share, 1.0 - panes.settings_share)
@@ -232,6 +248,7 @@ fn App() -> Element {
                     s.panes.side_width = sizes.side_width;
                     s.panes.settings_share = sizes.settings_share;
                     s.panes.camera_width = sizes.camera_width;
+                    s.panes.performance_width = sizes.performance_width;
                 });
             }
         }
@@ -242,12 +259,21 @@ fn App() -> Element {
         };
         let point = e.client_coordinates();
         let mut sizes = panes;
+        // Leaves at least `MIN_PANE_SIZE` for the pane that stretches.
+        let widest = |other_column: f64| {
+            (area.width() - 2.0 * WORKSPACE_PADDING - MIN_PANE_SIZE - other_column)
+                .max(MIN_PANE_SIZE)
+        };
         match splitter {
             Splitter::Side => {
                 let width = area.max_x() - WORKSPACE_PADDING - point.x;
-                let widest =
-                    (area.width() - 2.0 * WORKSPACE_PADDING - MIN_PANE_SIZE).max(MIN_PANE_SIZE);
-                sizes.side_width = width.clamp(MIN_PANE_SIZE, widest);
+                let performance = if panes.performance { panes.performance_width } else { 0.0 };
+                sizes.side_width = width.clamp(MIN_PANE_SIZE, widest(performance));
+            }
+            Splitter::Performance => {
+                let width = point.x - area.min_x() - WORKSPACE_PADDING;
+                let side = if panes.cameras && side_open { panes.side_width } else { 0.0 };
+                sizes.performance_width = width.clamp(MIN_PANE_SIZE, widest(side));
             }
             Splitter::Settings => {
                 let share = (point.y - area.min_y()) / area.height();
@@ -262,7 +288,7 @@ fn App() -> Element {
     };
     let workspace_class = match dragging().map(|drag| drag.splitter) {
         None => "workspace",
-        Some(Splitter::Side) => "workspace dragging columns",
+        Some(Splitter::Side | Splitter::Performance) => "workspace dragging columns",
         Some(Splitter::Settings) => "workspace dragging rows",
         Some(Splitter::CameraCorner) => "workspace dragging corner",
     };
@@ -277,10 +303,24 @@ fn App() -> Element {
                 let mut finish_drag = finish_drag.clone();
                 move |_| finish_drag()
             },
+            if panes.performance {
+                PaneFrame {
+                    pane: Pane::Performance,
+                    closable,
+                    style: if closable { "width: {panes.performance_width}px" } else { "flex: 1" },
+                    performance::Performance {}
+                }
+                if closable {
+                    div {
+                        class: "splitter columns",
+                        onmousedown: move |_| start_drag(dragging, Splitter::Performance, workspace()),
+                    }
+                }
+            }
             if panes.cameras {
                 PaneFrame { pane: Pane::Cameras, closable, cameras::Cameras {} }
             }
-            if panes.settings || panes.jobs {
+            if side_open {
                 if panes.cameras {
                     div {
                         class: "splitter columns",
@@ -333,6 +373,8 @@ struct Drag {
 enum Splitter {
     /// Between Cameras and the Settings/Jobs column.
     Side,
+    /// Right of Performance.
+    Performance,
     /// Between Settings and Jobs.
     Settings,
     /// A camera's box's bottom right corner, which resizes every camera's
@@ -428,12 +470,22 @@ fn use_hub() -> Arc<Hub> {
     use_context()
 }
 
+fn use_runtime() -> Handle {
+    use_context()
+}
+
 /// Mirrors one of the hub's channels into a signal.
 fn use_watch<T: Clone + 'static>(channel: fn(&Hub) -> &watch::Sender<T>) -> Signal<T> {
     let hub = use_hub();
-    let mut value = use_signal(|| channel(&hub).borrow().clone());
+    use_channel(channel(&hub))
+}
+
+/// Mirrors a channel into a signal.
+fn use_channel<T: Clone + 'static>(channel: &watch::Sender<T>) -> Signal<T> {
+    let mut value = use_signal(|| channel.borrow().clone());
+    let receiver = use_hook(|| channel.subscribe());
     use_future(move || {
-        let mut receiver = channel(&hub).subscribe();
+        let mut receiver = receiver.clone();
         async move {
             while receiver.changed().await.is_ok() {
                 value.set(receiver.borrow_and_update().clone());

@@ -15,15 +15,15 @@ use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use bytes::{Buf, Bytes, BytesMut};
 use chrono::Utc;
 use futures_util::{Stream, StreamExt};
 use protocol::{
-    AUDIO_FILE, Instructions, LEFT_FILE, MatchManifest, PreviewFrame, PreviewMessage, RIGHT_FILE,
-    Registration, Side, Timestamp, api, rig,
+    AUDIO_FILE, CameraStats, Instructions, LEFT_FILE, MatchManifest, PreviewFrame, PreviewMessage,
+    RIGHT_FILE, Registration, Side, Timestamp, UploadStart, api, rig,
 };
-use stitching::MatchCalibration;
+use stitching::geometry::Calibration;
 use stitching::recording::RecordingKey;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
@@ -37,11 +37,15 @@ pub async fn serve(hub: Arc<Hub>) -> Result<()> {
     let app = Router::new()
         .route(api::TIME, get(time))
         .route("/api/cameras/{camera}", put(register))
-        .route("/api/cameras/{camera}/instructions", get(instructions))
+        .route("/api/cameras/{camera}/instructions", post(instructions))
         .route("/api/cameras/{camera}/preview", get(preview))
         .route(
             "/api/cameras/{camera}/recordings/{match_id}",
             put(submit_recording),
+        )
+        .route(
+            "/api/cameras/{camera}/recordings/{match_id}/upload",
+            put(start_upload),
         )
         .route(
             "/api/cameras/{camera}/recordings/{match_id}/{segment}/{file}",
@@ -71,7 +75,7 @@ async fn register(
     Json(registration): Json<Registration>,
 ) -> ApiResult<StatusCode> {
     check_id(&camera)?;
-    let calibration: MatchCalibration =
+    let calibration: Calibration =
         serde_json::from_value(registration.calibration).map_err(bad_request)?;
     calibration.validate().map_err(bad_request)?;
     hub.register(
@@ -86,8 +90,9 @@ async fn register(
 async fn instructions(
     State(hub): State<Arc<Hub>>,
     Path(camera): Path<String>,
+    Json(stats): Json<CameraStats>,
 ) -> Result<Json<Instructions>, StatusCode> {
-    hub.instructions(&camera)
+    hub.instructions(&camera, &stats)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -122,6 +127,17 @@ async fn preview(
     }))
 }
 
+async fn start_upload(
+    State(hub): State<Arc<Hub>>,
+    Path((camera, match_id)): Path<(String, String)>,
+    Json(start): Json<UploadStart>,
+) -> ApiResult<StatusCode> {
+    check_id(&camera)?;
+    check_id(&match_id)?;
+    hub.start_receiving(RecordingKey { match_id, camera }, start.bytes);
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn upload_file(
     State(hub): State<Arc<Hub>>,
     Path((camera, match_id, segment, file)): Path<(String, String, i64, String)>,
@@ -139,19 +155,17 @@ async fn upload_file(
         }
         _ => file,
     };
-    let dir = hub
-        .paths
-        .recording(&RecordingKey { match_id, camera })
-        .join(segment.to_string());
+    let key = RecordingKey { match_id, camera };
+    let dir = hub.paths.recording(&key).join(segment.to_string());
     tokio::fs::create_dir_all(&dir).await.map_err(internal)?;
     let mut out = tokio::fs::File::create(dir.join(file))
         .await
         .map_err(internal)?;
     let mut body = body.into_data_stream();
     while let Some(chunk) = body.next().await {
-        out.write_all(&chunk.map_err(bad_request)?)
-            .await
-            .map_err(internal)?;
+        let chunk = chunk.map_err(bad_request)?;
+        out.write_all(&chunk).await.map_err(internal)?;
+        hub.received(&key, chunk.len() as u64);
     }
     out.sync_all().await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)

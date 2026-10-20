@@ -1,13 +1,15 @@
 //! Client for the cloud stitching server (see [`stitching::cloud`]).
 
+use std::io::SeekFrom;
 use std::path::Path;
 
 use anyhow::Result;
 use futures_util::StreamExt;
-use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, HeaderValue};
 use reqwest::{Body, Client, RequestBuilder, StatusCode};
-use stitching::cloud::{self, JobRequest, JobState};
+use stitching::cloud::{self, FileChunk, JobRequest, JobState};
 use stitching::recording::RecordingKey;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_util::io::ReaderStream;
 
@@ -61,26 +63,40 @@ impl Cloud {
         Ok(())
     }
 
-    /// Uploads a file of a recording, calling `sent` with the number of bytes
-    /// as they go out.
+    /// Uploads a file of a recording in chunks, calling `sent` with the
+    /// number of bytes as they go out.
     pub async fn upload_file(
         &self,
         path: &str,
         file: &Path,
-        mut sent: impl FnMut(u64) + Send + Sync + 'static,
+        sent: impl Fn(u64) + Clone + Send + Sync + 'static,
     ) -> Result<()> {
-        let contents = ReaderStream::with_capacity(tokio::fs::File::open(file).await?, 1 << 20)
-            .inspect(move |chunk| {
-                if let Ok(chunk) = chunk {
-                    sent(chunk.len() as u64);
-                }
-            });
-        self.request(self.http.put(self.endpoint(path)))
-            .body(Body::wrap_stream(contents))
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+        let size = tokio::fs::metadata(file).await?.len();
+        let mut offset = 0;
+        // An empty file takes a chunk too.
+        loop {
+            let length = cloud::CHUNK_BYTES.min(size - offset);
+            let mut contents = tokio::fs::File::open(file).await?;
+            contents.seek(SeekFrom::Start(offset)).await?;
+            let sent = sent.clone();
+            let contents =
+                ReaderStream::with_capacity(contents.take(length), 1 << 20).inspect(move |data| {
+                    if let Ok(data) = data {
+                        sent(data.len() as u64);
+                    }
+                });
+            self.request(self.http.put(self.endpoint(path)))
+                .query(&FileChunk { offset, size })
+                .header(CONTENT_LENGTH, length)
+                .body(Body::wrap_stream(contents))
+                .send()
+                .await?
+                .error_for_status()?;
+            offset += length;
+            if offset == size {
+                return Ok(());
+            }
+        }
     }
 
     /// The WebSocket request for forwarding a camera's live previews.
@@ -106,5 +122,77 @@ impl Cloud {
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}{path}", self.url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use axum::Router;
+    use axum::extract::{Query, State};
+    use axum::routing::put;
+
+    use super::*;
+
+    type Received = Arc<Mutex<Vec<(FileChunk, u64)>>>;
+
+    /// The chunks, with their bodies' lengths, and the bytes reported sent
+    /// for uploading a `size`-byte file.
+    async fn upload(size: u64) -> (Vec<(FileChunk, u64)>, u64) {
+        async fn receive(
+            State(received): State<Received>,
+            Query(chunk): Query<FileChunk>,
+            body: axum::body::Body,
+        ) {
+            let mut length = 0;
+            let mut body = body.into_data_stream();
+            while let Some(data) = body.next().await {
+                length += data.unwrap().len() as u64;
+            }
+            received.lock().unwrap().push((chunk, length));
+        }
+        let received = Received::default();
+        let app = Router::new()
+            .route("/file", put(receive))
+            .with_state(received.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let file =
+            std::env::temp_dir().join(format!("bsw-upload-test-{size}-{}", std::process::id()));
+        std::fs::File::create(&file).unwrap().set_len(size).unwrap();
+        let cloud = Cloud::new(&CloudSettings {
+            url,
+            token: "token".into(),
+        });
+        let sent = Arc::new(AtomicU64::new(0));
+        let count = {
+            let sent = sent.clone();
+            move |bytes| {
+                sent.fetch_add(bytes, Ordering::Relaxed);
+            }
+        };
+        cloud.upload_file("/file", &file, count).await.unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let received = received.lock().unwrap().clone();
+        (received, sent.load(Ordering::Relaxed))
+    }
+
+    #[tokio::test]
+    async fn files_go_up_in_chunks_no_bigger_than_the_limit() {
+        let chunk = |offset, size| FileChunk { offset, size };
+        let limit = cloud::CHUNK_BYTES;
+        assert_eq!(upload(0).await, (vec![(chunk(0, 0), 0)], 0));
+        assert_eq!(upload(limit).await, (vec![(chunk(0, limit), limit)], limit));
+        assert_eq!(
+            upload(limit + 1).await,
+            (
+                vec![(chunk(0, limit + 1), limit), (chunk(limit, limit + 1), 1)],
+                limit + 1
+            )
+        );
     }
 }

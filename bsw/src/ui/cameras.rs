@@ -3,8 +3,8 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 use protocol::{DEFAULT_AUDIO_DEVICE, Directive};
 
-use super::{Drag, Splitter, arctos_url, start_drag, use_hub, use_watch};
-use crate::hub::{Calibration, FieldStatus};
+use super::{Drag, Splitter, arctos_url, calibration, start_drag, use_hub, use_runtime, use_watch};
+use crate::hub::FieldStatus;
 use crate::server::Feed;
 use crate::settings::{Align, Overlay, Stitching};
 use stitching::overlay::PAGE_SIZE;
@@ -33,11 +33,11 @@ pub fn Cameras() -> Element {
 #[component]
 fn Camera(id: String) -> Element {
     let hub = use_hub();
+    let runtime = use_runtime();
     let cameras = use_watch(|hub| &hub.cameras);
     let settings = use_watch(|hub| &hub.settings);
     let fields = use_watch(|hub| &hub.fields);
     let arctos_fields = use_watch(|hub| &hub.arctos_fields);
-    let calibrations = use_watch(|hub| &hub.calibrations);
     let mut view_width = use_signal(|| 0.0);
     let mut card = use_signal(|| None::<Rc<MountedData>>);
     let dragging = use_context::<Signal<Option<Drag>>>();
@@ -75,6 +75,13 @@ fn Camera(id: String) -> Element {
             hub.update_settings(|s| s.cameras.entry(id.clone()).or_default().stream_url = url);
         }
     };
+    let set_stream_key = {
+        let (hub, id) = (hub.clone(), id.clone());
+        move |e: FormEvent| {
+            let key = Some(e.value()).filter(|k| !k.is_empty());
+            hub.update_settings(|s| s.cameras.entry(id.clone()).or_default().stream_key = key);
+        }
+    };
     let swap_sides = {
         let (hub, id) = (hub.clone(), id.clone());
         move |_| {
@@ -91,17 +98,6 @@ fn Camera(id: String) -> Element {
             hub.update_settings(|s| s.cameras.entry(id.clone()).or_default().audio_device = device);
         }
     };
-    let calibrate = {
-        let (hub, id) = (hub.clone(), id.clone());
-        move |_| hub.calibrate(&id)
-    };
-    let use_camera_calibration = {
-        let (hub, id) = (hub.clone(), id.clone());
-        move |_| hub.use_camera_calibration(&id)
-    };
-    let calibration_status = calibrations.read().get(&id).cloned();
-    let calibrating = calibration_status == Some(Calibration::Running);
-
     rsx! {
         div { class: "camera", onmounted: move |e| card.set(Some(e.data())),
             div { class: "camera-header",
@@ -110,6 +106,8 @@ fn Camera(id: String) -> Element {
                     span { class: "muted", "{address}" }
                 }
                 label { class: "field",
+                    title: "The Arctos field this camera records: it records the field's matches and uploads each \
+                            one to its match",
                     "Field "
                     select { onchange: set_field,
                         option { value: "", selected: camera.field.is_none(), "(none)" }
@@ -151,14 +149,33 @@ fn Camera(id: String) -> Element {
                     None => rsx! { p { class: "muted", "Not assigned to a field; not recording." } },
                 }
                 label { class: "stream",
-                    "Restream to "
+                    title: if settings.workflow.live_stream {
+                        "The RTMP server to restream this camera's stitched view to, e.g. YouTube Live's"
+                    } else {
+                        "Live streaming is off in the settings"
+                    },
+                    span { "Stream server" }
                     input {
                         r#type: "text",
-                        placeholder: "rtmp://a.rtmp.youtube.com/live2/…",
+                        placeholder: "rtmp://a.rtmp.youtube.com/live2",
                         value: camera.stream_url.clone().unwrap_or_default(),
                         disabled: !settings.workflow.live_stream,
-                        title: if !settings.workflow.live_stream { "Live streaming is off in the settings" },
                         onchange: set_stream_url,
+                    }
+                }
+                label { class: "stream",
+                    title: if settings.workflow.live_stream {
+                        "The key the stream server gave for this camera's stream"
+                    } else {
+                        "Live streaming is off in the settings"
+                    },
+                    span { "Stream key" }
+                    input {
+                        r#type: "password",
+                        autocomplete: "off",
+                        value: camera.stream_key.clone().unwrap_or_default(),
+                        disabled: !settings.workflow.live_stream,
+                        onchange: set_stream_key,
                     }
                 }
                 div { class: "camera-controls",
@@ -168,6 +185,7 @@ fn Camera(id: String) -> Element {
                         "Swap sides"
                     }
                     label {
+                        title: "Which of the camera's microphones records the matches' sound",
                         "Microphone "
                         select { onchange: set_audio_device,
                             option {
@@ -188,22 +206,12 @@ fn Camera(id: String) -> Element {
                         span { class: "error", "No audio" }
                     }
                     button {
-                        disabled: calibrating,
-                        title: "Find how the cameras are pointed from what they see now",
-                        onclick: calibrate,
-                        if calibrating { "Calibrating…" } else { "Calibrate" }
-                    }
-                    if camera.calibration.is_some() && !calibrating {
-                        button { onclick: use_camera_calibration, "Use camera's calibration" }
-                    }
-                    match calibration_status {
-                        Some(Calibration::Done(confidence)) => rsx! {
-                            span { class: "muted", "Calibrated ({confidence * 100.0:.0}% confident)" }
+                        title: "Calibrate the camera's lenses and alignment, and choose its view and blend",
+                        onclick: {
+                            let (hub, id) = (hub.clone(), id.clone());
+                            move |_| calibration::open(hub.clone(), runtime.clone(), id.clone())
                         },
-                        Some(Calibration::Failed(error)) => rsx! {
-                            span { class: "error", title: "{error}", "Calibration failed" }
-                        },
-                        _ => rsx! {},
+                        "Calibration…"
                     }
                 }
             }

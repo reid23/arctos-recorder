@@ -1,0 +1,15 @@
+#!/bin/sh
+# Starts the camera software, with the nominal calibration unless the
+# camera has its own.
+set -e
+
+if [ "$1" = configure ]; then
+    if [ ! -e /etc/csw/calibration.json ]; then
+        install -Dm644 /usr/share/csw/calibration.json /etc/csw/calibration.json
+    fi
+    systemctl enable csw.service
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        systemctl restart csw.service
+    fi
+fi

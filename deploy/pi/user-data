@@ -1,0 +1,25 @@
+#cloud-config
+# A camera's first boot (see deploy/pi/image.sh, which fills in the hash of
+# ar's password).
+
+preserve_hostname: true
+
+users:
+  - name: ar
+    groups: [adm, audio, dialout, gpio, i2c, input, netdev, plugdev, render, spi, sudo, users, video]
+    shell: /bin/bash
+    lock_passwd: false
+    hashed_passwd: "@PASSWORD_HASH@"
+ssh_pwauth: true
+
+runcmd:
+  - |
+    name=ar-$(tr -d '\0' < /proc/device-tree/serial-number | tail -c 6)
+    hostnamectl set-hostname "$name"
+    sed -i "s/^127\.0\.1\.1\s.*/127.0.1.1\t$name/" /etc/hosts
+    systemctl try-restart avahi-daemon.service
+  - [systemctl, enable, --now, ssh.service]
+  - [nmcli, connection, add, type, ethernet, ifname, eth0, con-name, Arctos Recorder cameras,
+     ipv4.method, link-local, ipv6.method, link-local, connection.autoconnect-priority, "100"]
+  - [nmcli, --wait, "20", connection, up, Arctos Recorder cameras]
+  - dpkg --install /boot/firmware/arctos-recorder-camera.deb && rm /boot/firmware/arctos-recorder-camera.deb

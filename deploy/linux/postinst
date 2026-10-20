@@ -1,0 +1,10 @@
+#!/bin/sh
+# Lets cameras through ufw, should it be turned on: they find the base
+# station by broadcasting on UDP port 7701 and then talk to it on TCP port
+# 7700, from the self-assigned addresses of the camera network.
+set -e
+
+if [ "$1" = configure ] && command -v ufw > /dev/null; then
+    ufw allow proto udp from 169.254.0.0/16 to any port 7701 comment 'Arctos Recorder cameras' > /dev/null
+    ufw allow proto tcp from 169.254.0.0/16 to any port 7700 comment 'Arctos Recorder cameras' > /dev/null
+fi

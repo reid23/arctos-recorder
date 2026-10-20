@@ -1,28 +1,22 @@
 {
-  "left_uniforms": {
-    "width": 2304, "height": 1296,
-    "fx": 982.0, "fy": 982.0,
-    "cx": 1152.0, "cy": 648.0,
-    "d": [0.6435, -0.3434, 0.0, 0.0]
-  },
-  "right_uniforms": {
-    "width": 2304, "height": 1296,
-    "fx": 982.0, "fy": 982.0,
-    "cx": 1152.0, "cy": 648.0,
-    "d": [0.6435, -0.3434, 0.0, 0.0]
-  },
-  "params": {
-    "cameraAxisOffset": 0.2134,
-    "intersect": 0.5527,
-    "xTy": 0.0,
-    "xRz": -0.5119,
-    "zRx": 0.5119,
-    "xRx": 0.0,
-    "zRz": 0.0
-  },
-  "rig_tilt": 0.4363,
-  "rig_roll": 0.0,
-  "sync_offset": 0,
-  "lens_correction_amount": 1.0,
-  "blend_width": 0.05
+  "cameras": [
+    {
+      "lens": {
+        "width": 2304, "height": 1296,
+        "fx": 982.0, "fy": 982.0,
+        "cx": 1151.5, "cy": 647.5,
+        "distortion": [0.6435, -0.3434, 0.0, 0.0]
+      },
+      "orientation": { "yaw": -53.0, "pitch": -25.0, "roll": 0.0 }
+    },
+    {
+      "lens": {
+        "width": 2304, "height": 1296,
+        "fx": 982.0, "fy": 982.0,
+        "cx": 1151.5, "cy": 647.5,
+        "distortion": [0.6435, -0.3434, 0.0, 0.0]
+      },
+      "orientation": { "yaw": 53.0, "pitch": -25.0, "roll": 0.0 }
+    }
+  ]
 }

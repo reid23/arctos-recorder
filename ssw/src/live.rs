@@ -8,9 +8,10 @@ use anyhow::{Context, Result, bail};
 use arctos::Arctos;
 use axum::extract::ws::{Message, WebSocket};
 use bytes::Bytes;
-use stitching::MatchCalibration;
+use stitching::browser::Chromium;
 use stitching::cloud::LiveConfig;
-use stitching::live::{self, LiveStitcher, StereoYuv};
+use stitching::geometry::StitchConfig;
+use stitching::live::{LiveStitcher, StereoYuv};
 use stitching::overlay::{self, PlacedImage};
 use stitching::restream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,12 +30,16 @@ pub async fn run(mut socket: WebSocket, arctos: &Arctos) -> Result<()> {
         bail!("expected the live config");
     };
     let LiveConfig {
-        calibration,
-        stream_url,
+        stitch,
+        preview_size,
+        size,
+        destination,
+        bitrate,
         overlay,
     } = serde_json::from_str(&config)?;
+    let (stitch, stitch_rx) = watch::channel(stitch);
 
-    let mut decoder = Command::new("ffmpeg")
+    let mut decoder = Command::new(stitching::ffmpeg_program())
         .args([
             "-loglevel",
             "error",
@@ -69,15 +74,18 @@ pub async fn run(mut socket: WebSocket, arctos: &Arctos) -> Result<()> {
     };
 
     let (panoramas, panoramas_rx) = watch::channel(None);
+    let chromium = Chromium::installed();
     // Never changes during the connection.
-    let (_overlay_config, overlay_config) = watch::channel(overlay);
+    let (_overlay_config, overlay_config) = watch::channel(overlay.map(|overlay| (overlay, size)));
     let (overlay_images, overlay_images_rx) = watch::channel(None);
     let runtime = Handle::current();
     let stitcher = tokio::task::spawn_blocking(move || {
-        stitch(
+        stitch_previews(
             &runtime,
             frames,
-            &calibration,
+            stitch_rx,
+            preview_size,
+            size,
             &overlay_images_rx,
             &panoramas,
         )
@@ -89,6 +97,9 @@ pub async fn run(mut socket: WebSocket, arctos: &Arctos) -> Result<()> {
                     stream.write_all(&chunk).await?;
                     let _ = stream_copy.try_send(chunk);
                 }
+                Message::Text(config) => {
+                    stitch.send_replace(serde_json::from_str(&config)?);
+                }
                 Message::Close(_) => break,
                 _ => {}
             }
@@ -98,30 +109,36 @@ pub async fn run(mut socket: WebSocket, arctos: &Arctos) -> Result<()> {
     tokio::select! {
         result = forward => result,
         result = stitcher => result?,
-        result = restream::stream(&stream_url, panoramas_rx, restream::Audio::MpegTs(&audio_url)) => result,
+        result = restream::stream(&destination, bitrate, panoramas_rx, restream::Audio::MpegTs(&audio_url)) => result,
         result = feed_audio => result,
-        () = overlay::follow_live(arctos, overlay_config, &overlay_images, live::OUTPUT_SIZE) => {
+        () = overlay::follow_live(arctos, &chromium, overlay_config, &overlay_images) => {
             unreachable!("the overlay config is still open")
         }
     }
 }
 
-fn stitch(
+fn stitch_previews(
     runtime: &Handle,
     mut frames: ChildStdout,
-    calibration: &MatchCalibration,
+    mut config: watch::Receiver<StitchConfig>,
+    preview_size: (u32, u32),
+    size: (u32, u32),
     overlay: &watch::Receiver<Option<Arc<PlacedImage>>>,
     panoramas: &watch::Sender<Option<bytes::Bytes>>,
 ) -> Result<()> {
-    let mut stitcher = LiveStitcher::new(calibration)?;
-    let mut frame = StereoYuv::new();
+    let mut stitcher = LiveStitcher::new(&config.borrow_and_update(), preview_size, size)?;
+    let mut frame = StereoYuv::new(preview_size);
     loop {
         runtime
             .block_on(frames.read_exact(frame.bytes_mut()))
             .context("decoder stopped")?;
-        let overlay = overlay.borrow().clone();
-        if let Some(jpeg) = stitcher.stitch(&frame, overlay.as_deref())? {
-            panoramas.send_replace(Some(jpeg));
+        if config.has_changed()?
+            && let Err(e) = stitcher.configure(&config.borrow_and_update())
+        {
+            tracing::warn!("keeping the last stitching config: {e:#}");
         }
+        let overlay = overlay.borrow().clone();
+        let jpeg = stitcher.stitch(&frame, overlay.as_ref())?;
+        panoramas.send_replace(Some(jpeg));
     }
 }

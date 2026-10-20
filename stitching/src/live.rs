@@ -1,139 +1,136 @@
 //! Stitching a camera's live previews into a panorama preview.
 
-use anyhow::Result;
+use std::sync::Arc;
+
+use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use protocol::{Side, rig};
-use reco_core::calibration::MatchCalibration;
-use reco_core::core::StitchCore;
-use reco_core::core::types::{RenderOutcome, StitchCoreConfig};
-use reco_core::gpu::GpuContext;
-use reco_core::render::pipeline::YuvPlanes;
-use reco_core::render::renderer::InputFormat;
-use reco_core::render::viewport::ViewportConfig;
-use turbojpeg::{Compressor, Decompressor, Image, PixelFormat, Subsamp, YuvImage};
+use turbojpeg::{Compressor, Decompressor, Subsamp, YuvImage};
 
+use crate::geometry::StitchConfig;
+use crate::gpu::{Gpu, Output, OverlayImage, Stitcher, YuvPlanes};
 use crate::overlay::PlacedImage;
 
-/// Size of the stitched preview.
-pub const OUTPUT_SIZE: (u32, u32) = (1280, 720);
 /// Frame rate of the previews.
 pub const FPS: u32 = rig::FPS / rig::PREVIEW_DECIMATION;
-const JPEG_QUALITY: i32 = 70;
+/// Of the stitched panoramas, which are compressed again to be restreamed.
+const JPEG_QUALITY: i32 = 90;
 
 pub struct LiveStitcher {
-    core: StitchCore,
+    stitcher: Stitcher,
+    preview_size: (u32, u32),
     compressor: Compressor,
-    /// The stitched frame with the overlay drawn on it.
-    composited: Vec<u8>,
+    /// The overlay drawn now, so it's only uploaded when it changes.
+    overlay: Option<Arc<PlacedImage>>,
 }
 
 impl LiveStitcher {
-    pub fn new(calibration: &MatchCalibration) -> Result<Self> {
-        let (width, height) = rig::PREVIEW_SIZE;
-        let mut config = StitchCoreConfig::new(
-            preview_calibration(calibration),
-            width,
-            height,
-            InputFormat::Yuv420p,
-        );
-        config.viewport = ViewportConfig {
-            width: OUTPUT_SIZE.0,
-            height: OUTPUT_SIZE.1,
-            blend_width: calibration.blend_width,
-            rig_tilt: calibration.rig_tilt as f32,
-            rig_roll: calibration.rig_roll as f32,
-            lens_correction_amount: calibration.lens_correction_amount,
-            ..ViewportConfig::default()
-        };
-        let mut core = StitchCore::new(GpuContext::new_blocking()?, config)?;
-        // Previews are decoded from JPEGs, which are full range.
-        core.pipeline_mut().set_full_range(true);
-        // Where the cameras' views don't meet, the panorama has black gaps;
-        // constraining the view to avoid them can zoom it in to nothing.
-        core.set_constrained_look(false);
+    /// Stitches `preview_size` previews into `size` panoramas.
+    pub fn new(config: &StitchConfig, preview_size: (u32, u32), size: (u32, u32)) -> Result<Self> {
+        let stitcher = Stitcher::new(&Gpu::shared()?, preview_size, size, Output::Jpeg, config)?;
         let mut compressor = Compressor::new()?;
         compressor.set_quality(JPEG_QUALITY)?;
+        compressor.set_subsamp(Subsamp::Sub2x2)?;
         Ok(LiveStitcher {
-            core,
+            stitcher,
+            preview_size,
             compressor,
-            composited: Vec::new(),
+            overlay: None,
         })
     }
 
-    pub fn set_calibration(&mut self, calibration: &MatchCalibration) {
-        self.core
-            .update_calibration(preview_calibration(calibration));
+    pub fn configure(&mut self, config: &StitchConfig) -> Result<()> {
+        self.stitcher.configure(config)
     }
 
-    /// Stitches a pair of previews into a JPEG, with `overlay` drawn on
-    /// top; `None` while the GPU is still busy with earlier frames.
+    pub fn preview_size(&self) -> (u32, u32) {
+        self.preview_size
+    }
+
+    pub fn output_size(&self) -> (u32, u32) {
+        self.stitcher.output_size()
+    }
+
+    /// Stitches a pair of previews into a JPEG with `overlay` drawn on top.
     pub fn stitch(
         &mut self,
         frame: &StereoYuv,
-        overlay: Option<&PlacedImage>,
-    ) -> Result<Option<Bytes>> {
-        let [left, right] = frame.planes();
-        let RenderOutcome::Rgba(rgba) = self.core.submit_frame_yuv(&left, &right)? else {
-            return Ok(None);
+        overlay: Option<&Arc<PlacedImage>>,
+    ) -> Result<Bytes> {
+        ensure!(
+            frame.preview_size() == self.preview_size,
+            "the previews are {:?}, not the {:?} being stitched",
+            frame.preview_size(),
+            self.preview_size
+        );
+        let unchanged = match (overlay, &self.overlay) {
+            (Some(new), Some(current)) => Arc::ptr_eq(new, current),
+            (None, None) => true,
+            _ => false,
         };
-        let pixels = match overlay {
-            Some(overlay) => {
-                self.composited.clear();
-                self.composited.extend_from_slice(rgba);
-                overlay
-                    .image
-                    .draw_onto(&mut self.composited, OUTPUT_SIZE, overlay.position);
-                &self.composited[..]
-            }
-            None => rgba,
-        };
-        let (width, height) = (OUTPUT_SIZE.0 as usize, OUTPUT_SIZE.1 as usize);
-        let jpeg = self.compressor.compress_to_vec(Image {
-            pixels,
-            width,
-            pitch: width * 4,
-            height,
-            format: PixelFormat::RGBA,
-        })?;
-        Ok(Some(jpeg.into()))
+        if !unchanged {
+            self.overlay = overlay.cloned();
+            self.stitcher
+                .set_overlay(overlay.map(|overlay| OverlayImage {
+                    image: &overlay.image,
+                    position: overlay.position,
+                }));
+        }
+        let (width, height) = self.stitcher.output_size();
+        let stitched = self.stitcher.stitch(frame.planes())?;
+        let jpeg = self
+            .compressor
+            .compress_yuv_to_vec(YuvImage {
+                pixels: stitched,
+                width: width as usize,
+                align: 1,
+                height: height as usize,
+                subsamp: Subsamp::Sub2x2,
+            })
+            .context("compressing the panorama")?;
+        Ok(jpeg.into())
     }
 }
 
-/// The calibration is for the recording resolution; previews have the same
-/// field of view at a lower resolution.
-pub(crate) fn preview_calibration(calibration: &MatchCalibration) -> MatchCalibration {
-    let scale = rig::PREVIEW_SIZE.0 as f64 / rig::RECORD_SIZE.0 as f64;
-    let mut scaled = calibration.clone();
-    for camera in [&mut scaled.left, &mut scaled.right] {
-        camera.width = rig::PREVIEW_SIZE.0;
-        camera.height = rig::PREVIEW_SIZE.1;
-        camera.fx *= scale;
-        camera.fy *= scale;
-        camera.cx *= scale;
-        camera.cy *= scale;
-    }
-    scaled
+/// The size of a pair of preview JPEGs; `None` if they differ, as they do
+/// for a moment while the cameras change it.
+pub fn pair_size(jpegs: [&[u8]; 2]) -> Result<Option<(u32, u32)>> {
+    let [left, right] = jpegs.map(|jpeg| {
+        turbojpeg::read_header(jpeg)
+            .map(|header| (header.width as u32, header.height as u32))
+            .context("reading a preview's size")
+    });
+    let (left, right) = (left?, right?);
+    Ok((left == right).then_some(left))
 }
 
 /// A pair of full-range YUV420P previews, the left one stacked on top of the
-/// right one. That makes it one ordinary [`StereoYuv::SIZE`] YUV420P frame
-/// for ffmpeg, while each camera's planes are still contiguous.
+/// right one. That makes it one ordinary [`StereoYuv::stacked_size`]
+/// YUV420P frame for ffmpeg, while each camera's planes are still
+/// contiguous.
 pub struct StereoYuv {
+    preview_size: (u32, u32),
     data: Vec<u8>,
-    scratch: Vec<u8>,
+    /// Each camera's preview as decoded.
+    scratch: [Vec<u8>; 2],
 }
 
 impl StereoYuv {
-    pub const SIZE: (u32, u32) = (rig::PREVIEW_SIZE.0, rig::PREVIEW_SIZE.1 * 2);
-    /// Luma bytes of one camera.
-    const LUMA: usize = (rig::PREVIEW_SIZE.0 * rig::PREVIEW_SIZE.1) as usize;
-    pub const BYTES: usize = Self::LUMA * 3;
-
-    pub fn new() -> Self {
+    pub fn new(preview_size: (u32, u32)) -> Self {
+        let luma = (preview_size.0 * preview_size.1) as usize;
         StereoYuv {
-            data: vec![0; Self::BYTES],
-            scratch: vec![0; Self::LUMA * 3 / 2],
+            preview_size,
+            data: vec![0; luma * 3],
+            scratch: [(); 2].map(|()| vec![0; luma * 3 / 2]),
         }
+    }
+
+    pub fn preview_size(&self) -> (u32, u32) {
+        self.preview_size
+    }
+
+    pub fn stacked_size(&self) -> (u32, u32) {
+        (self.preview_size.0, self.preview_size.1 * 2)
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -144,56 +141,126 @@ impl StereoYuv {
         &mut self.data
     }
 
-    /// Decodes one camera's preview JPEG into its half of the frame.
-    pub fn decode(
-        &mut self,
-        decompressor: &mut Decompressor,
-        side: Side,
-        jpeg: &[u8],
-    ) -> Result<()> {
-        decompressor.decompress_to_yuv(
-            jpeg,
-            YuvImage {
-                pixels: &mut self.scratch[..],
-                width: rig::PREVIEW_SIZE.0 as usize,
-                align: 1,
-                height: rig::PREVIEW_SIZE.1 as usize,
-                subsamp: Subsamp::Sub2x2,
-            },
-        )?;
-        let (y, chroma) = self.scratch.split_at(Self::LUMA);
-        let (u, v) = chroma.split_at(Self::LUMA / 4);
-        for (plane, src) in [y, u, v].into_iter().enumerate() {
-            let start = Self::plane_start(plane) + side.index() * src.len();
-            self.data[start..start + src.len()].copy_from_slice(src);
+    /// Luma bytes of one camera.
+    fn luma(&self) -> usize {
+        (self.preview_size.0 * self.preview_size.1) as usize
+    }
+
+    /// Decodes both cameras' preview JPEGs (indexed by [`Side::index`]) into
+    /// their halves of the frame, in parallel.
+    pub fn decode(&mut self, decompressors: &mut [Decompressor; 2], jpegs: [&[u8]; 2]) -> Result<()> {
+        let (width, height) = self.preview_size;
+        let decode_preview = |decompressor: &mut Decompressor, jpeg: &[u8], pixels: &mut [u8]| -> Result<()> {
+            let header = decompressor.read_header(jpeg).context("reading a preview's size")?;
+            ensure!(
+                (header.width, header.height) == (width as usize, height as usize),
+                "a preview is {} by {}, not {width} by {height}",
+                header.width,
+                header.height
+            );
+            decompressor
+                .decompress_to_yuv(
+                    jpeg,
+                    YuvImage {
+                        pixels,
+                        width: width as usize,
+                        align: 1,
+                        height: height as usize,
+                        subsamp: Subsamp::Sub2x2,
+                    },
+                )
+                .context("decoding a preview")
+        };
+        let [left_decompressor, right_decompressor] = decompressors;
+        let [left_pixels, right_pixels] = &mut self.scratch;
+        std::thread::scope(|scope| {
+            let right = scope.spawn(|| decode_preview(right_decompressor, jpegs[1], right_pixels));
+            decode_preview(left_decompressor, jpegs[0], left_pixels)?;
+            right
+                .join()
+                .map_err(|_| anyhow::anyhow!("decoding a preview panicked"))?
+        })?;
+        let luma = self.luma();
+        for (side, decoded) in Side::BOTH.into_iter().zip(&self.scratch) {
+            let (y, chroma) = decoded.split_at(luma);
+            let (u, v) = chroma.split_at(luma / 4);
+            for (plane, source) in [y, u, v].into_iter().enumerate() {
+                let start = plane_start(luma, plane) + side.index() * source.len();
+                self.data[start..start + source.len()].copy_from_slice(source);
+            }
         }
         Ok(())
     }
 
     /// Each camera's planes.
     pub fn planes(&self) -> [YuvPlanes<'_>; 2] {
+        let luma = self.luma();
         Side::BOTH.map(|side| {
             let [y, u, v] = [0, 1, 2].map(|plane| {
-                let len = if plane == 0 {
-                    Self::LUMA
-                } else {
-                    Self::LUMA / 4
-                };
-                let start = Self::plane_start(plane) + side.index() * len;
-                &self.data[start..start + len]
+                let length = if plane == 0 { luma } else { luma / 4 };
+                let start = plane_start(luma, plane) + side.index() * length;
+                &self.data[start..start + length]
             });
             YuvPlanes { y, u, v }
         })
     }
-
-    /// Offset of the stacked frame's Y, U or V plane.
-    fn plane_start(plane: usize) -> usize {
-        [0, Self::LUMA * 2, Self::LUMA * 5 / 2][plane]
-    }
 }
 
-impl Default for StereoYuv {
-    fn default() -> Self {
-        Self::new()
+/// Offset of the stacked frame's Y, U or V plane, for previews with `luma`
+/// bytes of luma each.
+fn plane_start(luma: usize, plane: usize) -> usize {
+    [0, luma * 2, luma * 5 / 2][plane]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gray_preview(size: (u32, u32), shade: u8) -> Vec<u8> {
+        let (width, height) = (size.0 as usize, size.1 as usize);
+        let pixels = vec![shade; width * height * 3];
+        let image = turbojpeg::Image {
+            pixels: pixels.as_slice(),
+            width,
+            pitch: width * 3,
+            height,
+            format: turbojpeg::PixelFormat::RGB,
+        };
+        turbojpeg::compress(image, 95, Subsamp::Sub2x2).unwrap().to_vec()
+    }
+
+    fn decompressors() -> [Decompressor; 2] {
+        [Decompressor::new().unwrap(), Decompressor::new().unwrap()]
+    }
+
+    fn near(values: &[u8], expected: u8) -> bool {
+        values.iter().all(|value| value.abs_diff(expected) <= 1)
+    }
+
+    #[test]
+    fn previews_of_any_size_are_stacked_left_over_right() {
+        let size = (64, 36);
+        let luma = 64 * 36;
+        let [left, right] = [gray_preview(size, 40), gray_preview(size, 200)];
+        assert_eq!(pair_size([&left, &right]).unwrap(), Some(size));
+        let mut frame = StereoYuv::new(size);
+        assert_eq!(frame.stacked_size(), (64, 72));
+        frame.decode(&mut decompressors(), [&left, &right]).unwrap();
+        assert_eq!(frame.bytes().len(), luma * 3);
+        assert!(near(&frame.bytes()[..luma], 40));
+        assert!(near(&frame.bytes()[luma..luma * 2], 200));
+        for (planes, shade) in frame.planes().into_iter().zip([40, 200]) {
+            assert_eq!((planes.y.len(), planes.u.len(), planes.v.len()), (luma, luma / 4, luma / 4));
+            assert!(near(planes.y, shade));
+            assert!(near(planes.u, 128) && near(planes.v, 128));
+        }
+    }
+
+    #[test]
+    fn previews_of_another_size_are_refused() {
+        let [small, big] = [gray_preview((64, 36), 40), gray_preview((128, 72), 40)];
+        assert_eq!(pair_size([&small, &big]).unwrap(), None);
+        let mut frame = StereoYuv::new((128, 72));
+        assert!(frame.decode(&mut decompressors(), [&small, &small]).is_err());
     }
 }

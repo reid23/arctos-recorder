@@ -3,36 +3,41 @@
 //! Everything the UI displays lives in a `watch` channel so components can
 //! subscribe to changes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use arctos::Arctos;
+use arctos::{Arctos, timestamp};
 use bytes::Bytes;
-use protocol::{AudioDevice, Directive, Instructions, MatchManifest, Side};
+use chrono::Utc;
+use protocol::{
+    AudioDevice, AutofocusOutcome, CameraStats, Directive, Focus, Instructions, MatchManifest,
+    Timestamp,
+};
+use stitching::JobStatus;
+use stitching::browser::Chromium;
+use stitching::geometry::{Calibration, StitchConfig};
 use stitching::recording::{RECORDING_FILE, Recording, RecordingKey};
-use stitching::{JobStatus, MatchCalibration};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::account::{ACCOUNT_FILE, Account};
+use crate::camera_port::CameraPort;
 use crate::jobs::{Job, Order};
+use crate::performance::{CameraUsage, FrameHistory, Performance};
 use crate::settings::Settings;
 use crate::{live, restream};
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Chunks of audio (about 21 ms each) kept for listeners that fall behind.
 const AUDIO_BACKLOG: usize = 64;
-/// Time between the preview pairs calibration uses, so they show the scene
-/// moving.
-const CALIBRATION_INTERVAL: Duration = Duration::from_millis(250);
-const CALIBRATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Hub {
     pub paths: Paths,
     pub arctos: Arctos,
+    pub chromium: Chromium,
     pub account: Arc<Account>,
     pub settings: watch::Sender<Settings>,
     /// The fields of the configured tournament, or why they couldn't be fetched.
@@ -42,13 +47,33 @@ pub struct Hub {
     /// By field name; only fields that a camera is assigned to.
     pub fields: watch::Sender<BTreeMap<String, FieldStatus>>,
     pub jobs: watch::Sender<Vec<Job>>,
-    /// By camera id; cameras calibrated since the app started.
-    pub calibrations: watch::Sender<BTreeMap<String, Calibration>>,
+    /// Cameras being calibrated, whose previews are stitched here even when
+    /// stitching in the cloud.
+    pub calibrating: watch::Sender<BTreeSet<String>>,
+    pub performance: watch::Sender<Performance>,
+    /// Only kept on Linux.
+    pub camera_port: watch::Sender<CameraPort>,
     links: Mutex<HashMap<String, Arc<CameraLink>>>,
     last_seen: Mutex<HashMap<String, Instant>>,
+    /// The frame counts each camera reported lately.
+    frame_histories: Mutex<HashMap<String, FrameHistory>>,
     /// Display names of matches seen on the scoreboard, by match id.
     match_titles: Mutex<HashMap<String, String>>,
+    /// Recordings arriving from the cameras.
+    receiving: Mutex<HashMap<RecordingKey, Transfer>>,
     job_queue: mpsc::UnboundedSender<Order>,
+}
+
+/// How much of a recording has arrived.
+struct Transfer {
+    received: u64,
+    total: u64,
+}
+
+impl Transfer {
+    fn percent(&self) -> u64 {
+        (self.received * 100).checked_div(self.total).unwrap_or(100)
+    }
 }
 
 pub struct Paths {
@@ -73,6 +98,17 @@ impl Paths {
         self.root.join("recordings")
     }
 
+    /// Where Chromium is downloaded to when no browser is installed.
+    pub fn chromium(&self) -> PathBuf {
+        self.root.join("chromium")
+    }
+
+    /// Where the calibration window keeps a camera's lens pictures and last
+    /// alignment between sessions.
+    pub fn calibration(&self, camera: &str) -> PathBuf {
+        self.root.join("calibration").join(camera)
+    }
+
     pub fn recording(&self, key: &RecordingKey) -> PathBuf {
         self.recordings().join(&key.match_id).join(&key.camera)
     }
@@ -88,15 +124,6 @@ pub struct CameraStatus {
     pub audio_devices: Vec<AudioDevice>,
 }
 
-/// Progress of calibrating a camera with the Calibrate button.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Calibration {
-    Running,
-    /// reco's confidence in the result, in `[0, 1]`.
-    Done(f64),
-    Failed(String),
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldStatus {
     pub directive: Directive,
@@ -107,11 +134,12 @@ pub struct FieldStatus {
 
 /// Live media of a registered camera.
 pub struct CameraLink {
-    /// The calibration in use: the user's from the settings, or else the
-    /// camera's.
-    pub calibration: watch::Sender<Arc<MatchCalibration>>,
+    /// How the camera's footage is stitched now: the camera's calibration
+    /// with the user's settings (see
+    /// [`CameraSettings::stitch_config`](crate::settings::CameraSettings::stitch_config)).
+    pub stitch: watch::Sender<Arc<StitchConfig>>,
     /// The calibration the camera sent when it registered.
-    reported_calibration: Mutex<Arc<MatchCalibration>>,
+    pub reported_calibration: watch::Sender<Calibration>,
     /// Latest preview of each camera, indexed by [`protocol::Side::index`].
     pub previews: [watch::Sender<Option<Bytes>>; 2],
     /// Latest stitched preview JPEG.
@@ -119,6 +147,51 @@ pub struct CameraLink {
     /// The microphone's audio as it arrives, as in [`protocol::AUDIO_FILE`].
     pub audio: broadcast::Sender<Bytes>,
     pub last_audio: Mutex<Option<Instant>>,
+    pub autofocus: watch::Sender<AutofocusState>,
+}
+
+/// Where autofocusing a camera's lenses is up to.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum AutofocusState {
+    #[default]
+    Idle,
+    /// Asked for at this time; waiting for the camera.
+    Requested(Timestamp),
+    /// Some lens found nothing to focus on.
+    Failed(AutofocusOutcome),
+}
+
+impl AutofocusState {
+    /// Takes in what the camera reports, returning where its lenses were
+    /// focused if that answers the request.
+    fn answer(&mut self, outcome: AutofocusOutcome) -> Option<[f32; 2]> {
+        if *self != AutofocusState::Requested(outcome.requested) {
+            return None;
+        }
+        match outcome.lens_positions {
+            [Some(left), Some(right)] => {
+                *self = AutofocusState::Idle;
+                Some([left, right])
+            }
+            _ => {
+                *self = AutofocusState::Failed(outcome);
+                None
+            }
+        }
+    }
+
+    /// Where to have the camera focus, given where its lenses are held;
+    /// `None` if they never were and no autofocus was asked for.
+    fn focus(&self, lens_positions: Option<[f32; 2]>) -> Option<Focus> {
+        match (*self, lens_positions) {
+            (AutofocusState::Requested(requested), _) => Some(Focus::Auto { requested }),
+            (_, Some(lens_positions)) => Some(Focus::Fixed { lens_positions }),
+            (AutofocusState::Failed(outcome), None) => Some(Focus::Auto {
+                requested: outcome.requested,
+            }),
+            (AutofocusState::Idle, None) => None,
+        }
+    }
 }
 
 impl Hub {
@@ -130,6 +203,7 @@ impl Hub {
         job_queue: mpsc::UnboundedSender<Order>,
     ) -> Self {
         Hub {
+            chromium: Chromium::installed_or_downloaded_into(paths.chromium()),
             paths,
             arctos,
             account: Arc::new(account),
@@ -138,10 +212,14 @@ impl Hub {
             cameras: watch::Sender::default(),
             fields: watch::Sender::default(),
             jobs: watch::Sender::default(),
-            calibrations: watch::Sender::default(),
+            calibrating: watch::Sender::default(),
+            performance: watch::Sender::default(),
+            camera_port: watch::Sender::default(),
             links: Mutex::default(),
             last_seen: Mutex::default(),
+            frame_histories: Mutex::default(),
             match_titles: Mutex::default(),
+            receiving: Mutex::default(),
             job_queue,
         }
     }
@@ -163,30 +241,36 @@ impl Hub {
         self: &Arc<Self>,
         camera: &str,
         address: IpAddr,
-        calibration: MatchCalibration,
+        calibration: Calibration,
         audio_devices: Vec<AudioDevice>,
     ) {
-        let reported = Arc::new(calibration);
-        let calibration = self
-            .chosen_calibration(camera)
-            .unwrap_or_else(|| reported.clone());
         let mut links = self.links.lock().unwrap();
         match links.get(camera) {
             Some(link) => {
-                *link.reported_calibration.lock().unwrap() = reported;
-                link.calibration.send_replace(calibration);
+                link.reported_calibration.send_if_modified(|reported| {
+                    let changed = *reported != calibration;
+                    *reported = calibration;
+                    changed
+                });
             }
             None => {
+                let stitch = self.stitch_config(camera, &calibration);
                 let link = Arc::new(CameraLink {
-                    calibration: watch::Sender::new(calibration),
-                    reported_calibration: Mutex::new(reported),
+                    stitch: watch::Sender::new(Arc::new(stitch)),
+                    reported_calibration: watch::Sender::new(calibration),
                     previews: Default::default(),
                     panorama: watch::Sender::new(None),
                     audio: broadcast::channel(AUDIO_BACKLOG).0,
                     last_audio: Mutex::new(None),
+                    autofocus: watch::Sender::default(),
                 });
                 live::spawn(self.clone(), camera.to_owned(), link.clone());
                 tokio::spawn(restream::run(self.clone(), camera.to_owned(), link.clone()));
+                tokio::spawn(follow_stitch_config(
+                    self.clone(),
+                    camera.to_owned(),
+                    link.clone(),
+                ));
                 links.insert(camera.to_owned(), link);
             }
         }
@@ -210,79 +294,15 @@ impl Hub {
         tracing::info!("camera {camera} registered from {address}");
     }
 
-    /// The calibration the user chose for `camera`, if any.
-    fn chosen_calibration(&self, camera: &str) -> Option<Arc<MatchCalibration>> {
-        let settings = self.settings.borrow();
-        let chosen = settings.cameras.get(camera)?.calibration.clone()?;
-        match serde_json::from_value(chosen) {
-            Ok(calibration) => Some(Arc::new(calibration)),
-            Err(e) => {
-                tracing::error!("ignoring the saved calibration of {camera}: {e}");
-                None
-            }
-        }
-    }
-
-    /// Calibrates `camera` from its previews, using the result from now on.
-    pub fn calibrate(self: &Arc<Self>, camera: &str) {
-        let Some(link) = self.link(camera) else {
-            return;
-        };
-        let set_status = {
-            let (hub, camera) = (self.clone(), camera.to_owned());
-            move |status| {
-                hub.calibrations.send_modify(|calibrations| {
-                    calibrations.insert(camera.clone(), status);
-                })
-            }
-        };
-        set_status(Calibration::Running);
-        let (hub, camera) = (self.clone(), camera.to_owned());
-        tokio::spawn(async move {
-            let result = async {
-                let previews = tokio::time::timeout(CALIBRATION_TIMEOUT, collect_previews(&link))
-                    .await
-                    .context("the camera isn't sending previews")?;
-                let current = link.calibration.borrow().clone();
-                tokio::task::spawn_blocking(move || {
-                    stitching::calibrate::calibrate(&current, &previews)
-                })
-                .await?
-            }
-            .await;
-            match result {
-                Ok(calibrated) => {
-                    let saved = serde_json::to_value(&calibrated.calibration)
-                        .expect("calibrations serialize");
-                    hub.update_settings(|s| {
-                        s.cameras.entry(camera.clone()).or_default().calibration = Some(saved)
-                    });
-                    link.calibration
-                        .send_replace(Arc::new(calibrated.calibration));
-                    set_status(Calibration::Done(calibrated.confidence));
-                }
-                Err(e) => {
-                    tracing::warn!("calibrating {camera}: {e:#}");
-                    set_status(Calibration::Failed(format!("{e:#}")));
-                }
-            }
-        });
-    }
-
-    /// Goes back to the calibration `camera` sends.
-    pub fn use_camera_calibration(&self, camera: &str) {
-        self.update_settings(|s| {
-            if let Some(settings) = s.cameras.get_mut(camera) {
-                settings.calibration = None;
-            }
-        });
-        if let Some(link) = self.link(camera) {
-            let reported = link.reported_calibration.lock().unwrap().clone();
-            link.calibration.send_replace(reported);
-        }
-        self.calibrations.send_modify(|calibrations| {
-            calibrations.remove(camera);
-        });
+    /// How to stitch `camera`'s footage given the calibration it sends.
+    fn stitch_config(&self, camera: &str, reported: &Calibration) -> StitchConfig {
+        self.settings
+            .borrow()
+            .cameras
+            .get(camera)
+            .cloned()
+            .unwrap_or_default()
+            .stitch_config(reported)
     }
 
     /// Keeps [`CameraStatus::online`] up to date.
@@ -315,10 +335,55 @@ impl Hub {
         self.links.lock().unwrap().get(camera).cloned()
     }
 
-    /// What `camera` should be doing; `None` if it hasn't registered.
-    pub fn instructions(&self, camera: &str) -> Option<Instructions> {
-        *self.last_seen.lock().unwrap().get_mut(camera)? = Instant::now();
+    /// Has `camera` autofocus its lenses, once it isn't recording.
+    pub fn autofocus(&self, camera: &str) {
+        if let Some(link) = self.link(camera) {
+            link.autofocus.send_replace(AutofocusState::Requested(timestamp(Utc::now())));
+        }
+    }
+
+    /// Takes in how `camera` is doing and says what it should be doing;
+    /// `None` if it hasn't registered.
+    pub fn instructions(&self, camera: &str, stats: &CameraStats) -> Option<Instructions> {
+        let now = Instant::now();
+        *self.last_seen.lock().unwrap().get_mut(camera)? = now;
+        let link = self.link(camera)?;
+        if let Some(outcome) = stats.autofocus {
+            let mut focused = None;
+            link.autofocus.send_if_modified(|state| {
+                let before = *state;
+                focused = state.answer(outcome);
+                *state != before
+            });
+            if let Some(lens_positions) = focused {
+                self.update_settings(|settings| {
+                    settings.cameras.entry(camera.to_owned()).or_default().lens_positions = Some(lens_positions);
+                });
+            }
+        }
         let settings = self.settings.borrow();
+        let lens_positions = settings.cameras.get(camera).and_then(|c| c.lens_positions);
+        let focus = link.autofocus.borrow().focus(lens_positions);
+        let focus = focus.unwrap_or_else(|| {
+            let requested = timestamp(Utc::now());
+            link.autofocus.send_replace(AutofocusState::Requested(requested));
+            Focus::Auto { requested }
+        });
+        let mut losses = self
+            .frame_histories
+            .lock()
+            .unwrap()
+            .entry(camera.to_owned())
+            .or_default()
+            .add(now, stats.frames);
+        if settings.swaps_sides(camera) {
+            losses.reverse();
+        }
+        self.performance.send_modify(|performance| {
+            performance
+                .cameras
+                .insert(camera.to_owned(), CameraUsage::new(stats, losses));
+        });
         let field = settings.cameras.get(camera).and_then(|c| c.field.as_ref());
         let fields = self.fields.borrow();
         Some(Instructions {
@@ -326,6 +391,12 @@ impl Hub {
                 .and_then(|field| fields.get(field))
                 .map_or(Directive::Idle, |status| status.directive.clone()),
             audio_device: settings.audio_device(camera).to_owned(),
+            record_quality: settings.recording.camera_quality,
+            preview_size: settings.live.camera_size,
+            preview_quality: settings.live.camera_quality,
+            focus,
+            margins: settings.recording.margins,
+            buffer: settings.recording.buffer,
         })
     }
 
@@ -334,6 +405,51 @@ impl Hub {
             .lock()
             .unwrap()
             .insert(match_id.to_owned(), title);
+    }
+
+    /// A match's display name; its id if it wasn't seen on the scoreboard.
+    fn match_title(&self, match_id: &str) -> String {
+        self.match_titles
+            .lock()
+            .unwrap()
+            .get(match_id)
+            .cloned()
+            .unwrap_or_else(|| match_id.to_owned())
+    }
+
+    /// Shows a recording a camera is about to send, `bytes` long, as a job.
+    pub fn start_receiving(&self, key: RecordingKey, bytes: u64) {
+        if self.paths.recording(&key).join(RECORDING_FILE).exists() {
+            // The camera didn't hear our acknowledgement and sends it again.
+            return;
+        }
+        let title = self.match_title(&key.match_id);
+        self.receiving.lock().unwrap().insert(
+            key.clone(),
+            Transfer {
+                received: 0,
+                total: bytes,
+            },
+        );
+        self.show_job(key, title, JobStatus::Receiving(0.0));
+    }
+
+    /// Counts `bytes` more of a recording as arrived.
+    pub fn received(&self, key: &RecordingKey, bytes: u64) {
+        let percent = {
+            let mut receiving = self.receiving.lock().unwrap();
+            let Some(transfer) = receiving.get_mut(key) else {
+                return;
+            };
+            let before = transfer.percent();
+            transfer.received += bytes;
+            let percent = transfer.percent();
+            // Every chunk would be too many updates for the UI.
+            (percent != before).then_some(percent)
+        };
+        if let Some(percent) = percent {
+            self.set_job_status(key, JobStatus::Receiving(percent as f32 / 100.0));
+        }
     }
 
     /// Stores the description of a fully uploaded recording and queues it for
@@ -349,20 +465,14 @@ impl Hub {
             return Ok(());
         }
         let link = self.link(camera).context("camera is not registered")?;
-        let title = self
-            .match_titles
-            .lock()
-            .unwrap()
-            .get(&key.match_id)
-            .cloned()
-            .unwrap_or_else(|| key.match_id.clone());
         let recording = Recording {
             tournament: self.settings.borrow().arctos.tournament.clone(),
-            title,
-            calibration: (**link.calibration.borrow()).clone(),
+            title: self.match_title(&key.match_id),
+            stitch: (**link.stitch.borrow()).clone(),
             manifest,
         };
         recording.save(&dir)?;
+        self.receiving.lock().unwrap().remove(&key);
         self.enqueue(key, recording.title, false);
         Ok(())
     }
@@ -370,18 +480,19 @@ impl Hub {
     /// Adds a job (or resets an existing one) and queues it. `release` lets
     /// its next step go ahead even if the settings say it should wait.
     pub fn enqueue(&self, key: RecordingKey, title: String, release: bool) {
-        self.jobs
-            .send_modify(|jobs| match jobs.iter_mut().find(|job| job.key == key) {
-                Some(job) => job.status = JobStatus::Queued,
-                None => jobs.push(Job {
-                    key: key.clone(),
-                    title,
-                    status: JobStatus::Queued,
-                }),
-            });
+        self.show_job(key.clone(), title, JobStatus::Queued);
         self.job_queue
             .send(Order { key, release })
             .expect("job worker outlives the hub");
+    }
+
+    /// Adds a job, or sets an existing one's status.
+    fn show_job(&self, key: RecordingKey, title: String, status: JobStatus) {
+        self.jobs
+            .send_modify(|jobs| match jobs.iter_mut().find(|job| job.key == key) {
+                Some(job) => job.status = status,
+                None => jobs.push(Job { key, title, status }),
+            });
     }
 
     pub fn set_job_status(&self, key: &RecordingKey, status: JobStatus) {
@@ -393,17 +504,83 @@ impl Hub {
     }
 }
 
-/// [`stitching::calibrate::PAIRS`] pairs of the camera's latest previews,
-/// [`CALIBRATION_INTERVAL`] apart.
-async fn collect_previews(link: &CameraLink) -> Vec<[Bytes; 2]> {
-    let mut ticker = tokio::time::interval(CALIBRATION_INTERVAL);
-    let mut pairs = Vec::with_capacity(stitching::calibrate::PAIRS);
-    while pairs.len() < stitching::calibrate::PAIRS {
-        ticker.tick().await;
-        let [left, right] = Side::BOTH.map(|side| link.previews[side.index()].borrow().clone());
-        if let (Some(left), Some(right)) = (left, right) {
-            pairs.push([left, right]);
+/// Keeps [`CameraLink::stitch`] up to date with the settings and the
+/// calibration the camera sends.
+async fn follow_stitch_config(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) {
+    let mut settings = hub.settings.subscribe();
+    let mut reported = link.reported_calibration.subscribe();
+    loop {
+        let config = hub.stitch_config(&camera, &reported.borrow_and_update());
+        link.stitch.send_if_modified(|current| {
+            let changed = **current != config;
+            if changed {
+                *current = Arc::new(config);
+            }
+            changed
+        });
+        let changed = tokio::select! {
+            changed = settings.changed() => changed,
+            changed = reported.changed() => changed,
+        };
+        if changed.is_err() {
+            return;
         }
     }
-    pairs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autofocus_takes_only_the_answer_to_its_request() {
+        let asked = Timestamp(1_000);
+        let mut state = AutofocusState::Requested(asked);
+        assert_eq!(state.focus(Some([1.0, 1.0])), Some(Focus::Auto { requested: asked }));
+        let stale = AutofocusOutcome {
+            requested: Timestamp(500),
+            lens_positions: [Some(3.0), Some(3.0)],
+        };
+        assert_eq!(state.answer(stale), None);
+        assert_eq!(state, AutofocusState::Requested(asked));
+
+        let found = AutofocusOutcome {
+            requested: asked,
+            lens_positions: [Some(9.5), Some(9.75)],
+        };
+        assert_eq!(state.answer(found), Some([9.5, 9.75]));
+        assert_eq!(state, AutofocusState::Idle);
+        assert_eq!(state.answer(found), None, "it was answered already");
+        assert_eq!(
+            state.focus(Some([9.5, 9.75])),
+            Some(Focus::Fixed { lens_positions: [9.5, 9.75] })
+        );
+        assert_eq!(state.focus(None), None);
+    }
+
+    #[test]
+    fn lenses_that_fail_to_autofocus_go_back_or_wait_to_be_asked_again() {
+        let asked = Timestamp(1_000);
+        let failed = AutofocusOutcome {
+            requested: asked,
+            lens_positions: [Some(9.5), None],
+        };
+        let mut state = AutofocusState::Requested(asked);
+        assert_eq!(state.answer(failed), None);
+        assert_eq!(state, AutofocusState::Failed(failed));
+        assert_eq!(
+            state.focus(Some([1.0, 2.0])),
+            Some(Focus::Fixed { lens_positions: [1.0, 2.0] })
+        );
+        assert_eq!(state.focus(None), Some(Focus::Auto { requested: asked }));
+    }
+
+    #[test]
+    fn transfers_count_whole_percents() {
+        let percent = |received, total| Transfer { received, total }.percent();
+        assert_eq!(percent(0, 0), 100, "nothing to receive");
+        assert_eq!(percent(0, 3), 0);
+        assert_eq!(percent(2, 3), 66);
+        assert_eq!(percent(3, 3), 100);
+    }
 }

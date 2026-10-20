@@ -5,8 +5,10 @@
 //! [`stitching::recording`]). A recording is stitched (locally into
 //! [`VIDEO_FILE`], or on the cloud server, which uploads it too), then the
 //! video is uploaded. Either step can be held back by the settings until the
-//! user releases it. The media is deleted only once the video is on Arctos,
-//! leaving [`RECORDING_FILE`](stitching::recording::RECORDING_FILE) and
+//! user releases it. Each step takes one job at a time, but they run side by
+//! side, so a video can be uploading while the next recording is stitched.
+//! The media is deleted only once the video is on Arctos, leaving
+//! [`RECORDING_FILE`](stitching::recording::RECORDING_FILE) and
 //! [`UPLOADED_FILE`] behind as a record.
 
 use std::path::Path;
@@ -18,8 +20,8 @@ use anyhow::{Result, bail};
 use arctos::TokenSource;
 use stitching::JobStatus;
 use stitching::cloud::JobRequest;
-use stitching::recording::{OverlayImages, Recording, RecordingKey, VIDEO_FILE, render};
-use tokio::sync::mpsc::UnboundedReceiver;
+use stitching::recording::{self, OverlayImages, Recording, RecordingKey, VIDEO_FILE, render};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::cloud::Cloud;
 use crate::hub::Hub;
@@ -74,11 +76,30 @@ pub fn restore(hub: &Hub) -> Result<()> {
     Ok(())
 }
 
+/// A job on its way through the steps, with its recording.
+type Step = (Order, Recording);
+
+/// Passes each order to the step its job is at.
 pub async fn run(hub: Arc<Hub>, mut queue: UnboundedReceiver<Order>) {
+    let (uploads, upload_queue) = mpsc::unbounded_channel();
+    let (stitches, stitch_queue) = mpsc::unbounded_channel();
+    tokio::spawn(stitch_each(hub.clone(), stitch_queue, uploads.clone()));
+    tokio::spawn(upload_each(hub.clone(), upload_queue));
     while let Some(order) = queue.recv().await {
-        if let Err(e) = process(&hub, &order).await {
-            fail(&hub, &order.key, e);
-        }
+        let dir = hub.paths.recording(&order.key);
+        let recording = match Recording::load(&dir) {
+            Ok(recording) => recording,
+            Err(e) => {
+                fail(&hub, &order.key, e);
+                continue;
+            }
+        };
+        let step = if dir.join(VIDEO_FILE).exists() {
+            &uploads
+        } else {
+            &stitches
+        };
+        step.send((order, recording)).expect("the steps outlive the queue");
     }
 }
 
@@ -87,40 +108,65 @@ fn fail(hub: &Hub, key: &RecordingKey, error: anyhow::Error) {
     hub.set_job_status(key, JobStatus::Failed(format!("{error:#}")));
 }
 
-async fn process(hub: &Arc<Hub>, order: &Order) -> Result<()> {
-    let key = &order.key;
-    let dir = hub.paths.recording(key);
-    let recording = Recording::load(&dir)?;
-    let settings = hub.settings.borrow().clone();
-    let mut release = order.release;
-
-    let video = dir.join(VIDEO_FILE);
-    if !video.exists() {
-        if settings.stitches_later() && !release {
+/// Stitches each recording, or sends it to the cloud server, passing the
+/// videos stitched here on to be uploaded.
+async fn stitch_each(hub: Arc<Hub>, mut queue: UnboundedReceiver<Step>, uploads: UnboundedSender<Step>) {
+    while let Some((order, recording)) = queue.recv().await {
+        let key = &order.key;
+        let settings = hub.settings.borrow().clone();
+        if settings.stitches_later() && !order.release {
             hub.set_job_status(key, JobStatus::StitchLater);
-            return Ok(());
+            continue;
         }
-        release = false;
-        match settings.stitching {
-            Stitching::Local => stitch(hub, key, &dir, &recording).await?,
-            Stitching::Cloud => return send_to_cloud(hub, key, recording).await,
+        let stitched = match settings.stitching {
+            Stitching::Local => stitch(&hub, key, &hub.paths.recording(key), &recording).await,
+            Stitching::Cloud => {
+                if let Err(e) = send_to_cloud(&hub, key, recording).await {
+                    fail(&hub, key, e);
+                }
+                continue;
+            }
+        };
+        match stitched {
+            Ok(()) => {
+                hub.set_job_status(key, JobStatus::Queued);
+                // Letting a job go ahead only lets its next step go ahead.
+                let order = Order {
+                    release: false,
+                    ..order
+                };
+                uploads.send((order, recording)).expect("the upload step outlives the stitching step");
+            }
+            Err(e) => fail(&hub, key, e),
         }
     }
+}
 
-    if settings.workflow.upload_later && !release {
+async fn upload_each(hub: Arc<Hub>, mut queue: UnboundedReceiver<Step>) {
+    while let Some((order, recording)) = queue.recv().await {
+        if let Err(e) = upload(&hub, &order, &recording).await {
+            fail(&hub, &order.key, e);
+        }
+    }
+}
+
+async fn upload(hub: &Hub, order: &Order, recording: &Recording) -> Result<()> {
+    let key = &order.key;
+    if hub.settings.borrow().workflow.upload_later && !order.release {
         hub.set_job_status(key, JobStatus::UploadLater);
         return Ok(());
     }
     hub.set_job_status(key, JobStatus::Uploading(0.0));
+    let dir = hub.paths.recording(key);
     let anchors = recording.anchors();
     hub.arctos
         .upload_footage(
             hub.account.as_ref(),
-            &recording.footage(key, &video, &anchors),
+            &recording.footage(key, &dir.join(VIDEO_FILE), &anchors),
             |p| hub.set_job_status(key, JobStatus::Uploading(p)),
         )
         .await?;
-    finish(hub, key, &dir, &recording)
+    finish(hub, key, &dir, recording)
 }
 
 async fn stitch(
@@ -130,9 +176,14 @@ async fn stitch(
     recording: &Recording,
 ) -> Result<()> {
     hub.set_job_status(key, JobStatus::Stitching(0.0));
-    let placement = hub.settings.borrow().overlay.clone();
+    let stitch = recording.stitch.clone();
+    let size = tokio::task::spawn_blocking(move || recording::output_size(&stitch)).await??;
+    let (placement, quality) = {
+        let settings = hub.settings.borrow();
+        (settings.overlay.clone(), settings.recording.video_quality)
+    };
     let overlay = if placement.enabled {
-        Some(OverlayImages::fetch(&hub.arctos, recording, &placement).await?)
+        Some(OverlayImages::fetch(&hub.arctos, recording, &placement, size).await?)
     } else {
         None
     };
@@ -141,7 +192,7 @@ async fn stitch(
         Arc::new(move |p| hub.set_job_status(&key, JobStatus::Stitching(p)))
     };
     let (dir, recording) = (dir.to_owned(), recording.clone());
-    tokio::task::spawn_blocking(move || render(&dir, &recording, overlay.as_ref(), progress))
+    tokio::task::spawn_blocking(move || render(&dir, &recording, size, quality, overlay.as_ref(), progress))
         .await??;
     Ok(())
 }
@@ -168,9 +219,13 @@ async fn send_recording(
     recording: &Recording,
 ) -> Result<()> {
     let dir = hub.paths.recording(key);
-    let overlay = hub.settings.borrow().overlay.clone();
+    let (overlay, quality) = {
+        let settings = hub.settings.borrow();
+        (settings.overlay.clone(), settings.recording.video_quality)
+    };
     let request = JobRequest {
         recording: recording.clone(),
+        quality,
         overlay: overlay.enabled.then_some(overlay),
     };
     let state = cloud.put_job(key, &request).await?;

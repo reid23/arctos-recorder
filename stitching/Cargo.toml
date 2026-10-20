@@ -11,16 +11,24 @@ protocol.workspace = true
 arctos.workspace = true
 anyhow.workspace = true
 base64 = "0.22"
+bytemuck = { version = "1", features = ["derive"] }
 bytes.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+nalgebra.workspace = true
 png = "0.17"
-reco-calibrate.workspace = true
-reco-core.workspace = true
-reco-io.workspace = true
+pollster = "0.4"
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
 tracing.workspace = true
 turbojpeg.workspace = true
+wgpu = "28"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

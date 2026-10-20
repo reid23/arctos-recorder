@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use protocol::MatchManifest;
+use protocol::{MatchManifest, UploadStart};
 use tokio::sync::Notify;
 
 use crate::base::BaseStation;
@@ -35,9 +35,18 @@ async fn upload_all(base: &BaseStation, root: &Path) -> Result<()> {
         };
         let manifest: MatchManifest = serde_json::from_slice(&manifest)?;
         tracing::info!("uploading match {}", manifest.match_id);
-        for (segment, file) in manifest.files() {
-            let path = dir.join(segment.dir_name()).join(file);
-            base.upload_file(&manifest.match_id, &segment, file, &path)
+        let files: Vec<_> = manifest
+            .files()
+            .map(|(segment, file)| (segment, file, dir.join(segment.dir_name()).join(file)))
+            .collect();
+        let mut bytes = 0;
+        for (_, _, path) in &files {
+            bytes += tokio::fs::metadata(path).await?.len();
+        }
+        base.start_upload(&manifest.match_id, &UploadStart { bytes })
+            .await?;
+        for (segment, file, path) in &files {
+            base.upload_file(&manifest.match_id, segment, file, path)
                 .await?;
         }
         base.upload_manifest(&manifest).await?;

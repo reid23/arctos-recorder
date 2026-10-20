@@ -4,11 +4,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/csw
+ExecStart=/usr/bin/csw
 StateDirectory=csw
 Restart=always
 RestartSec=2
 Environment=RUST_LOG=info
+Environment=LIBCAMERA_IPA_CONFIG_PATH=/usr/share/csw/libcamera
 
 [Install]
 WantedBy=multi-user.target

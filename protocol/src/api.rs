@@ -4,8 +4,9 @@
 //! |---|---|---|---|
 //! | GET  | [`TIME`] | | [`Timestamp`](crate::Timestamp) |
 //! | PUT  | [`camera`] | [`Registration`](crate::Registration) | 204 |
-//! | GET  | [`instructions`] | | [`Instructions`](crate::Instructions) |
+//! | POST | [`instructions`] | [`CameraStats`](crate::CameraStats) | [`Instructions`](crate::Instructions) |
 //! | GET  | [`preview`] | WebSocket of [`PreviewMessage`](crate::PreviewMessage)s | |
+//! | PUT  | [`upload`] | [`UploadStart`](crate::UploadStart) | 204 |
 //! | PUT  | [`recording_file`] | raw file contents | 204 |
 //! | PUT  | [`recording`] | [`MatchManifest`](crate::MatchManifest) | 204 once stored |
 //!
@@ -46,6 +47,10 @@ pub fn preview(camera: &str) -> String {
 
 pub fn recording(camera: &str, match_id: &str) -> String {
     format!("/api/cameras/{camera}/recordings/{match_id}")
+}
+
+pub fn upload(camera: &str, match_id: &str) -> String {
+    format!("/api/cameras/{camera}/recordings/{match_id}/upload")
 }
 
 pub fn recording_file(camera: &str, match_id: &str, segment: &Segment, file: &str) -> String {
