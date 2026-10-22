@@ -20,14 +20,10 @@ This system aims to:
 	
 ## Assumptions
 
-ngl really unsure about which of these are reasonable
-
 - there is a power outlet available.
 - The cell network has 50Mb/s of upload speed.
 
-## Requirements Tree
-
-todo: finish this tree. currently only have L1 requirements.
+## Requirements
 
 The system shall:
 1. get match footage on Arctos within 30 minutes of the end of the
@@ -39,32 +35,83 @@ The system shall:
    once on a single Starlink connection
 5. require less than 60 minutes of day-of setup for one person to
    record five fields.
-6. cost less than $ 1250 to initially purchase for five fields (can be
-   reasonably paid off by a tournament over 3-ish years)
-7. cost less than $ 25 per tournament day to operate.
+6. have a BOM cost less than $ 1250 to initially purchase for five
+   fields (can be reasonably paid off by a tournament over 3-ish years)
+8. cost less than $ 25 per tournament day to operate.
+9. not require any existing field infrastructure besides the two bullets
+   listed in [[#Assumptions]]
 
+### Initial Decisions/Conclusions
 
-## Implementation Plan
+A couple of things were immediately ruled out by these requirements:
+- using player-provided phones. This is a lot of risk since we won't
+  have hardware access for testing.
+- single cameras: to get the whole field in view, the mount must be
+  incredibly tall, making it very expensive and difficult to
+  construct.
+- separate cell uplinks at every field: this is a lot of hardware to
+  purchase, plus a lot of recurring cost to pay for cell plans.
+- non-centralized processing: generally, the more compute we can
+  combine into the base station, the the system will be, since we
+  won't have to buy a copy of the hardware for each field.
 
-There will be one central computer running a desktop app `bsw` (base
-software) and acting as a router. It will connect to a PoE switch,
-which connects to a recording device on each field. Each recording
-device will run the `csw` (camera software) app.
+Given these, I decided on the architecture described below.
 
-The recording devices will comprise of:
-- a 2.7m tripod
-- a Raspberry Pi 5 (2gb) with a PoE hat
-- two wide angle cameras (Camera Module 3 Wide, or equivalent)
-- a usb microphone
+## System Overview
 
-### `csw` logic
+There is one central computer running the `bsw` (base software) app.
+It is connected to a PoE (Power over Ethernet) switch, which has
+ethernet cables to a camera rig on each field. The camera rigs run
+the `csw` (camera software) app.
+
+The camera rigs will be mounted on 2.7m tripods and spaced at least 1m
+away from the edge of the field. They will have:
+- a Raspberry Pi 5 with 2GB+ RAM
+- a PoE HAT
+- two wide angle CSI cameras
+- a USB microphone
+- a cooling system (copecopecope)
+
+The mounting height and distance were chosen based on the availability of cost-effective tripods; a different height can work but may require a different minimum distance from the field and different camera positions. 
+
+The system looks like this:
+<img width="1440" height="1920" alt="image" src="https://github.com/user-attachments/assets/18a3816f-19eb-4d7d-87cd-c3da7d7b8fed" />
+
+### BOM
+
+The full hardware BOM is as follows:
+
+| part | qty | cost (ea) | source |
+|------|-----|-----------|--------|
+|Pi 5 2GB|1/field|77.50|[PiShop](https://www.pishop.us/product/raspberry-pi-5-2gb/)|
+|Pi 5 PoE HAT|1/field|20.95|[PiShop](https://www.pishop.us/product/poe-hat-g-compatible-with-raspberry-pi-5-cm5-5v-5a-output-802-3af-at/)|
+|wide angle CSI camera|2/field|30.00|[Amazon](https://www.amazon.com/dp/B0C5D97DRJ)|
+|RPi active cooler|1/field|5.00|[DigiKey](https://www.digikey.com/en/products/detail/raspberry-pi/SC1148/21658255)|
+|USB microphone|1/field|8.99|[Amazon](https://a.co/d/05wimx7k)|
+|100ft ethernet cable|1/field|21.99|[Amazon](https://a.co/d/095YrWB3)|
+|2.7m tripod|1/field|59.99|[Amazon](https://a.co/d/047WDrRC)|
+|M3x12mm screw|5/field|0.0587|[McMaster](https://www.mcmaster.com/91290A500/)|
+|M2x12mm screw|8/field|0.0587|[McMaster](https://www.mcmaster.com/91292A834/)|
+|M2 hex nut|8/field|0.0306|[McMaster](https://www.mcmaster.com/90591A265/)|
+|M2 washer|8/field|0.0272|[McMaster](https://www.mcmaster.com/93475A195/)|
+|1/4"-#20 heat-set threaded insert|1/field|0.25|[Amazon](https://a.co/d/0e3IGgWV)|
+|8-port 120W PoE Switch|1|39.99|[Amazon](https://a.co/d/02OrRrvX)|
+
+plus 3D printed components (CAD coming soon).
+
+This gives a theoretical BOM cost of $255.89 per field, plus the 
+39.99 PoE switch. This *is* over the target budget, but not by that 
+much, and I am currently investigating the feasibility of using a 1GB 
+Pi 5, which would bring us *just* under the target cost.
+
+### High-Level `csw` logic
 
 1. wait for base station to connect. it will be available on a known
    domain.
 2. make a request to the base station to register this camera.
    - send ID info, camera calibration, sync time with base station.
-3. start the [low-res] stream. 1536×864 @ 30fps probably. mjpg, low
-   jpg quality. integrate audio somehow.
+3. start the [low-res] stream. 1536×864 @ 30fps is typical. mjpg, low
+   jpg quality. 
 4. poll at 1hz for match/point status on this field.
 
 When a match is going, start recording timestamped frames to an
@@ -89,38 +136,32 @@ reasonable quality level), this is 0.67Gbps of data to store. If we
 take $\Delta t = 10\mathrm{s}$, we get that our buffer will be
 836MB. We have 2gb of ram, so this should be feasible.
 
-Once the match ends, the video (with all the points concatenated) will
-be uploaded to the base station. Once the base station confirms
-receipt, the files should be deleted from the camera.
+Once the match ends, the video (with all the points concatenated) gets
+uploaded to the base station. Once the base station confirms receipt, 
+the files are deleted from the camera.
 
 ### `bsw` logic
 
-`bsw` will be either a complete dioxus app or a rust backend with a
-typescript frontend connected with `ts-rs`. not sure which. Maybe the
-former, since it'll be cleaner than opening a browser and running a
-command.
-
-Anyway. `bsw` will:
+`bsw` will:
 - poll Arctos for match data and relay it to the cameras 
-- present a UI for managing the cameras, viewing the streams, and
-  mapping them to fields on Arctos.
+- present a UI for:
+    - calibrating the cameras
+    - viewing the streams
+    - mapping cameras to fields on Arctos
 - optionally stream the low-quality live stream over rtmp
 - receive match video clips and upload them to a server. This will
   either happen as soon as they are received, or at a later time (ie,
   just leave the videos on disk and then upload them at the end of the
   day).
 
-The other key feature is panorama stitching. There will be two
+The other key feature is panorama stitching. There are two
 operating modes: local and cloud stitching. For local stitching, `bsw`
-will stitch together the low-quality streams live before streaming
-them, and stitch the video clips (and concatenate them) before
-uploading directly to Arctos. For cloud stitching mode, a separate
-server will handle the heavy compute task of stitching and
-concatenating all the videos.
-
-In order to account for latency, we'll have to update the Arctos
-scoreboard overlay (which should be optionally included in the feeds)
-to have a configurable latency.
+stitches the low-quality streams live before streaming them, and stitches 
+the video clips before uploading directly to Arctos. For cloud stitching 
+mode, a separate server handles the heavy compute task of stitching and
+concatenating all the videos. This helps when the base station has no GPU,
+but also when the base station must not consume a ton of power (for 
+example, if the system is powered by a portable battery)
 
 ### Algorithms
 
@@ -159,7 +200,7 @@ horribly non-performant python code from lab into beautiful
 GPU-optimized Rust! How wonderful!
 
 
-## Usage
+## Usage & Details
 
 The workspace has these crates:
 
