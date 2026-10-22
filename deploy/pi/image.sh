@@ -46,6 +46,7 @@ sed "s|@PASSWORD_HASH@|$password_hash|" deploy/pi/user-data > "$work/user-data"
 printf 'network:\n  config: disabled\n' > "$work/network-config"
 mtype -i "$boot" ::config.txt > "$work/config.txt"
 printf '\n# Arctos Recorder cameras use neither Wi-Fi nor Bluetooth.\ndtoverlay=disable-wifi\ndtoverlay=disable-bt\n' >> "$work/config.txt"
+printf '\n# Not every imx708 module is auto-detected.\ncamera_auto_detect=0\ndtoverlay=imx708,cam0\ndtoverlay=imx708,cam1\n' >> "$work/config.txt"
 mcopy -o -i "$boot" "$work/user-data" "$work/network-config" "$work/config.txt" ::
 mcopy -o -i "$boot" "$package" ::arctos-recorder-camera.deb
 rm "$work/user-data" "$work/network-config" "$work/config.txt"

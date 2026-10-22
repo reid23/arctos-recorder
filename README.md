@@ -305,8 +305,17 @@ camera. Its window walks through
 focusing the lenses, fitting each lens to pictures of a chessboard,
 entering how the cameras are mounted, aligning them from what they both
 see, and choosing the view and blend. What it saves overrides the
-camera's calibration on this base station, and is sent to the cloud
+calibration at `/etc/csw/calibration.json`, and is sent to the cloud
 server along with live previews and recordings.
+
+The camera keeps this setup, along with its swapped sides, microphone,
+lens positions and output shape, in `/var/lib/csw/setup.json`, so any
+base station it connects to stitches it the same way. When a camera
+connects, its setup replaces the base station's copy in `settings.json`;
+a camera that keeps none is given the base station's copy. Each base
+station keeps its own field, stream server and stream key for a camera,
+and the chessboard pictures and alignment its Calibration window starts
+from.
 
 A camera autofocuses the first time it connects and whenever Focus is
 pressed (once it isn't recording); its lenses are then held there. A
@@ -367,8 +376,9 @@ setup. On its first boot a camera:
   ar@ar-<serial>.local`;
 - installs the camera software with the nominal calibration.
 
-Wi-Fi and Bluetooth are turned off. To update a camera's software, `just
-deploy-csw ar@ar-<serial>.local`.
+Wi-Fi and Bluetooth are turned off, and the two cameras are set up as
+imx708 sensors on the Pi's two camera ports rather than auto-detected. To
+update a camera's software, `just deploy-csw ar@ar-<serial>.local`.
 
 Raspberry Pi changes libcamera's ABI without changing its soname, so the
 camera software is built against the image's very libcamera, and its

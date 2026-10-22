@@ -187,6 +187,18 @@ pub struct CameraSettings {
     pub stream_url: Option<String>,
     /// The key the RTMP server gave for the stream, which ends its URL.
     pub stream_key: Option<String>,
+    /// A copy of the setup the camera keeps: replaced by the camera's when
+    /// it connects with one, and given to a camera that keeps none.
+    #[serde(flatten)]
+    pub setup: RigSetup,
+}
+
+/// How a camera's rig is set up. The camera keeps it (see
+/// [`protocol::Instructions::setup`]), so any base station it connects to
+/// stitches its footage the same way.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RigSetup {
     /// Whether the camera's left and right feeds are the other way round.
     pub swap_sides: bool,
     /// ALSA PCM name of the microphone; `None` for the ALSA default.
@@ -207,7 +219,7 @@ pub struct CameraSettings {
     pub lens_positions: Option<[f32; 2]>,
 }
 
-impl CameraSettings {
+impl RigSetup {
     /// `values` indexed by the camera's own sides, indexed instead as the
     /// sides are shown.
     pub fn as_shown<T>(&self, mut values: [T; 2]) -> [T; 2] {
@@ -266,19 +278,19 @@ impl Settings {
 
     /// Size of a camera's stitched live preview.
     pub fn live_size(&self, camera: &str) -> (u32, u32) {
-        let aspect_ratio = self.cameras.get(camera).map(|c| c.aspect_ratio).unwrap_or_default();
+        let aspect_ratio = self.cameras.get(camera).map(|c| c.setup.aspect_ratio).unwrap_or_default();
         aspect_ratio.size_with_width(self.live.width as f64)
     }
 
     pub fn swaps_sides(&self, camera: &str) -> bool {
-        self.cameras.get(camera).is_some_and(|c| c.swap_sides)
+        self.cameras.get(camera).is_some_and(|c| c.setup.swap_sides)
     }
 
     /// ALSA PCM name of the microphone `camera` should capture.
     pub fn audio_device(&self, camera: &str) -> &str {
         self.cameras
             .get(camera)
-            .and_then(|c| c.audio_device.as_deref())
+            .and_then(|c| c.setup.audio_device.as_deref())
             .unwrap_or(protocol::DEFAULT_AUDIO_DEVICE)
     }
 
@@ -310,15 +322,33 @@ mod tests {
     #[test]
     fn stitching_follows_where_the_lenses_are_held() {
         let reported = Calibration::nominal([Orientation::default(); 2]);
-        let mut settings = CameraSettings::default();
-        assert_eq!(settings.stitch_config(&reported).calibration, reported);
+        let mut setup = RigSetup::default();
+        assert_eq!(setup.stitch_config(&reported).calibration, reported);
 
-        settings.lens_positions = Some([9.5, 4.0]);
-        settings.swap_sides = true;
-        let [left, right] = settings.stitch_config(&reported).calibration.cameras.map(|camera| camera.lens);
+        setup.lens_positions = Some([9.5, 4.0]);
+        setup.swap_sides = true;
+        let [left, right] = setup.stitch_config(&reported).calibration.cameras.map(|camera| camera.lens);
         let nominal = Lens::nominal();
         assert_eq!((left.focus, right.focus), (4.0, 9.5));
         assert!((left.fx - nominal.fx * magnification(DEFAULT_FOCUS, 4.0)).abs() < 1e-9);
         assert!((right.fy - nominal.fy * magnification(DEFAULT_FOCUS, 9.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_cameras_setup_is_saved_among_its_other_settings() {
+        let saved = r#"{"cameras": {"ar-1": {"field": "Field 1", "swap_sides": true, "lens_positions": [9.5, 4.0]}}}"#;
+        let settings: Settings = serde_json::from_str(saved).unwrap();
+        let camera = &settings.cameras["ar-1"];
+        assert_eq!(camera.field.as_deref(), Some("Field 1"));
+        assert_eq!(
+            camera.setup,
+            RigSetup {
+                swap_sides: true,
+                lens_positions: Some([9.5, 4.0]),
+                ..RigSetup::default()
+            }
+        );
+        let resaved = serde_json::to_value(&settings).unwrap();
+        assert_eq!(resaved["cameras"]["ar-1"]["lens_positions"], serde_json::json!([9.5, 4.0]));
     }
 }

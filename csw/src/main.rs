@@ -13,6 +13,7 @@ mod dma;
 mod pairing;
 mod preview;
 mod recorder;
+mod setup;
 mod stats;
 mod upload;
 
@@ -35,6 +36,7 @@ use tracing_subscriber::EnvFilter;
 use crate::base::BaseStation;
 use crate::clock::Clock;
 use crate::recorder::{Input, Recorder};
+use crate::setup::KeptSetup;
 use crate::stats::{FrameCounters, Reporter};
 
 const POLL: Duration = Duration::from_secs(1);
@@ -49,7 +51,8 @@ struct Args {
     /// network by default.
     #[arg(long, env = "CSW_BASE_URL")]
     base_url: Option<String>,
-    /// Where recordings are kept until they are uploaded.
+    /// Where the rig's setup is kept, and recordings until they are
+    /// uploaded.
     #[arg(long, env = "CSW_DATA_DIR", default_value = "/var/lib/csw")]
     data_dir: PathBuf,
     /// The rig's calibration (a `stitching::geometry::Calibration` JSON
@@ -74,10 +77,11 @@ async fn main() -> Result<()> {
         .to_owned();
     let calibration: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&args.calibration)?)?;
+    let setup = KeptSetup::load(args.data_dir.join(setup::FILE));
     let discover = args.base_url.is_none();
     let base = BaseStation::new(args.base_url.unwrap_or_default(), camera);
     let clock = Arc::new(Clock::default());
-    connect(&base, discover, &clock, &calibration).await;
+    connect(&base, discover, &clock, &calibration, setup.current()).await;
 
     let recordings = args.data_dir.join("recordings");
     std::fs::create_dir_all(&recordings)?;
@@ -148,7 +152,7 @@ async fn main() -> Result<()> {
         buffer,
     };
     let reporter = Reporter::new(counters, autofocus_rx);
-    follow_instructions(&base, discover, &clock, &calibration, controlled, reporter).await
+    follow_instructions(&base, discover, &clock, &calibration, setup, controlled, reporter).await
 }
 
 /// What the base station's instructions control.
@@ -169,6 +173,7 @@ async fn connect(
     discover: bool,
     clock: &Clock,
     calibration: &serde_json::Value,
+    setup: Option<&serde_json::Value>,
 ) {
     loop {
         let attempt = async {
@@ -178,6 +183,7 @@ async fn connect(
             base.sync_clock(clock).await?;
             base.register(&Registration {
                 calibration: calibration.clone(),
+                setup: setup.cloned(),
                 audio_devices: audio::devices(),
             })
             .await
@@ -200,14 +206,15 @@ async fn connect(
 }
 
 /// Polls the base station for what to do, telling it how the camera is
-/// doing, and forwards changes to what the instructions control. If the
-/// base station goes away, the last instructions stay in effect until it is
-/// back.
+/// doing, forwards changes to what the instructions control, and keeps the
+/// rig's setup they carry. If the base station goes away, the last
+/// instructions stay in effect until it is back.
 async fn follow_instructions(
     base: &BaseStation,
     discover: bool,
     clock: &Clock,
     calibration: &serde_json::Value,
+    mut setup: KeptSetup,
     controlled: Controlled,
     mut reporter: Reporter,
 ) -> Result<()> {
@@ -242,10 +249,13 @@ async fn follow_instructions(
                 controlled.focus.send_replace(Some(instructions.focus));
                 controlled.margins.send_replace(instructions.margins);
                 controlled.buffer.send_replace(instructions.buffer);
+                if let Err(e) = setup.keep(instructions.setup) {
+                    tracing::warn!("keeping the rig's setup: {e:#}");
+                }
             }
             Err(e) => {
                 tracing::warn!("lost the base station: {e:#}");
-                connect(base, discover, clock, calibration).await;
+                connect(base, discover, clock, calibration, setup.current()).await;
                 synced = Instant::now();
             }
         }

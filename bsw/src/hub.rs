@@ -27,7 +27,7 @@ use crate::account::{ACCOUNT_FILE, Account};
 use crate::camera_port::CameraPort;
 use crate::jobs::{Job, Order};
 use crate::performance::{CameraUsage, FrameHistory, Performance};
-use crate::settings::Settings;
+use crate::settings::{RigSetup, Settings};
 use crate::{live, restream};
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -136,7 +136,7 @@ pub struct FieldStatus {
 pub struct CameraLink {
     /// How the camera's footage is stitched now: the camera's calibration
     /// with the user's settings (see
-    /// [`CameraSettings::stitch_config`](crate::settings::CameraSettings::stitch_config)).
+    /// [`RigSetup::stitch_config`](crate::settings::RigSetup::stitch_config)).
     pub stitch: watch::Sender<Arc<StitchConfig>>,
     /// The calibration the camera sent when it registered.
     pub reported_calibration: watch::Sender<Calibration>,
@@ -236,14 +236,19 @@ impl Hub {
     }
 
     /// Records a (re)connecting camera, starting its live pipeline the first
-    /// time it is seen.
+    /// time it is seen. The setup the camera keeps, if any, replaces this
+    /// computer's copy.
     pub fn register(
         self: &Arc<Self>,
         camera: &str,
         address: IpAddr,
         calibration: Calibration,
+        setup: Option<RigSetup>,
         audio_devices: Vec<AudioDevice>,
     ) {
+        if let Some(setup) = setup {
+            self.update_settings(|settings| settings.cameras.entry(camera.to_owned()).or_default().setup = setup);
+        }
         let mut links = self.links.lock().unwrap();
         match links.get(camera) {
             Some(link) => {
@@ -300,7 +305,7 @@ impl Hub {
             .borrow()
             .cameras
             .get(camera)
-            .cloned()
+            .map(|camera| camera.setup.clone())
             .unwrap_or_default()
             .stitch_config(reported)
     }
@@ -344,10 +349,12 @@ impl Hub {
 
     /// Takes in how `camera` is doing and says what it should be doing;
     /// `None` if it hasn't registered.
-    pub fn instructions(&self, camera: &str, stats: &CameraStats) -> Option<Instructions> {
+    pub fn instructions(&self, camera: &str, stats: &CameraStats) -> Result<Option<Instructions>> {
         let now = Instant::now();
-        *self.last_seen.lock().unwrap().get_mut(camera)? = now;
-        let link = self.link(camera)?;
+        let Some(link) = self.link(camera) else {
+            return Ok(None);
+        };
+        self.last_seen.lock().unwrap().insert(camera.to_owned(), now);
         if let Some(outcome) = stats.autofocus {
             let mut focused = None;
             link.autofocus.send_if_modified(|state| {
@@ -357,12 +364,12 @@ impl Hub {
             });
             if let Some(lens_positions) = focused {
                 self.update_settings(|settings| {
-                    settings.cameras.entry(camera.to_owned()).or_default().lens_positions = Some(lens_positions);
+                    settings.cameras.entry(camera.to_owned()).or_default().setup.lens_positions = Some(lens_positions);
                 });
             }
         }
         let settings = self.settings.borrow();
-        let lens_positions = settings.cameras.get(camera).and_then(|c| c.lens_positions);
+        let lens_positions = settings.cameras.get(camera).and_then(|c| c.setup.lens_positions);
         let focus = link.autofocus.borrow().focus(lens_positions);
         let focus = focus.unwrap_or_else(|| {
             let requested = timestamp(Utc::now());
@@ -385,8 +392,9 @@ impl Hub {
                 .insert(camera.to_owned(), CameraUsage::new(stats, losses));
         });
         let field = settings.cameras.get(camera).and_then(|c| c.field.as_ref());
+        let setup = settings.cameras.get(camera).map(|c| c.setup.clone()).unwrap_or_default();
         let fields = self.fields.borrow();
-        Some(Instructions {
+        Ok(Some(Instructions {
             directive: field
                 .and_then(|field| fields.get(field))
                 .map_or(Directive::Idle, |status| status.directive.clone()),
@@ -397,7 +405,8 @@ impl Hub {
             focus,
             margins: settings.recording.margins,
             buffer: settings.recording.buffer,
-        })
+            setup: serde_json::to_value(setup)?,
+        }))
     }
 
     pub fn remember_match_title(&self, match_id: &str, title: String) {
@@ -530,7 +539,50 @@ async fn follow_stitch_config(hub: Arc<Hub>, camera: String, link: Arc<CameraLin
 
 #[cfg(test)]
 mod tests {
+    use stitching::geometry::Orientation;
+
     use super::*;
+
+    #[tokio::test]
+    async fn the_setup_a_camera_keeps_replaces_this_computers_copy() {
+        let root = std::env::temp_dir().join(format!("bsw-hub-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = Paths::new(root).unwrap();
+        let arctos = Arctos::from_env().unwrap();
+        let account = Account::load(arctos.clone(), paths.account()).unwrap();
+        let ours = RigSetup {
+            swap_sides: true,
+            ..RigSetup::default()
+        };
+        let mut settings = Settings::default();
+        settings.cameras.entry("ar-1".to_owned()).or_default().setup = ours.clone();
+        let (job_queue, _jobs) = mpsc::unbounded_channel();
+        let hub = Arc::new(Hub::new(paths, arctos, account, settings, job_queue));
+        let address = IpAddr::from([10, 42, 0, 2]);
+        let calibration = Calibration::nominal([Orientation::default(); 2]);
+        let stats = CameraStats {
+            cpu: None,
+            memory: None,
+            temperature: None,
+            frames: Default::default(),
+            autofocus: None,
+        };
+        let given = || {
+            let instructions = hub.instructions("ar-1", &stats).unwrap().unwrap();
+            serde_json::from_value::<RigSetup>(instructions.setup).unwrap()
+        };
+
+        hub.register("ar-1", address, calibration.clone(), None, Vec::new());
+        assert_eq!(given(), ours, "a camera that keeps no setup is given this computer's");
+
+        let theirs = RigSetup {
+            audio_device: Some("plughw:CARD=USB,DEV=0".to_owned()),
+            ..RigSetup::default()
+        };
+        hub.register("ar-1", address, calibration, Some(theirs.clone()), Vec::new());
+        assert_eq!(hub.settings.borrow().cameras["ar-1"].setup, theirs);
+        assert_eq!(given(), theirs);
+    }
 
     #[test]
     fn autofocus_takes_only_the_answer_to_its_request() {

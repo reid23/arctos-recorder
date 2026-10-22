@@ -71,7 +71,7 @@ pub fn change_calibration(hub: &Hub, camera: &str, change: impl FnOnce(&mut Cali
     let mut calibration = link.stitch.borrow().calibration.clone();
     change(&mut calibration);
     hub.update_settings(|settings| {
-        settings.cameras.entry(camera.to_owned()).or_default().calibration = Some(calibration);
+        settings.cameras.entry(camera.to_owned()).or_default().setup.calibration = Some(calibration);
     });
 }
 

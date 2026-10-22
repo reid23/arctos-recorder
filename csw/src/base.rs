@@ -9,6 +9,7 @@ use protocol::{
     CameraStats, Instructions, MatchManifest, Registration, Segment, Timestamp, UploadStart, api,
 };
 use reqwest::{Body, Client};
+use tokio::sync::watch;
 use tokio_util::io::ReaderStream;
 
 use crate::clock::Clock;
@@ -23,6 +24,7 @@ pub struct BaseStation {
     /// rediscovered.
     url: Arc<RwLock<String>>,
     camera: String,
+    registered: watch::Sender<()>,
 }
 
 impl BaseStation {
@@ -35,6 +37,7 @@ impl BaseStation {
             http,
             url: Arc::new(RwLock::new(url)),
             camera,
+            registered: watch::Sender::new(()),
         }
     }
 
@@ -48,6 +51,14 @@ impl BaseStation {
 
     pub fn camera(&self) -> &str {
         &self.camera
+    }
+
+    /// Changes each time the camera registers, as it does after losing the
+    /// base station. A base station that went away (unplugged, say) leaves
+    /// connections to it hanging rather than failing, so long-lived ones are
+    /// remade on each change.
+    pub fn registrations(&self) -> watch::Receiver<()> {
+        self.registered.subscribe()
     }
 
     pub fn preview_url(&self) -> String {
@@ -81,6 +92,7 @@ impl BaseStation {
             .send()
             .await?
             .error_for_status()?;
+        self.registered.send_replace(());
         Ok(())
     }
 

@@ -86,8 +86,8 @@ fn Camera(id: String) -> Element {
         let (hub, id) = (hub.clone(), id.clone());
         move |_| {
             hub.update_settings(|s| {
-                let camera = s.cameras.entry(id.clone()).or_default();
-                camera.swap_sides = !camera.swap_sides;
+                let setup = &mut s.cameras.entry(id.clone()).or_default().setup;
+                setup.swap_sides = !setup.swap_sides;
             })
         }
     };
@@ -95,7 +95,7 @@ fn Camera(id: String) -> Element {
         let (hub, id) = (hub.clone(), id.clone());
         move |e: FormEvent| {
             let device = Some(e.value()).filter(|d| d != DEFAULT_AUDIO_DEVICE);
-            hub.update_settings(|s| s.cameras.entry(id.clone()).or_default().audio_device = device);
+            hub.update_settings(|s| s.cameras.entry(id.clone()).or_default().setup.audio_device = device);
         }
     };
     rsx! {
@@ -190,12 +190,12 @@ fn Camera(id: String) -> Element {
                         select { onchange: set_audio_device,
                             option {
                                 value: DEFAULT_AUDIO_DEVICE,
-                                selected: camera.audio_device.is_none(),
+                                selected: camera.setup.audio_device.is_none(),
                                 "ALSA default"
                             }
                             for device in audio_devices {
                                 option {
-                                    selected: camera.audio_device.as_ref() == Some(&device.name),
+                                    selected: camera.setup.audio_device.as_ref() == Some(&device.name),
                                     value: "{device.name}",
                                     "{device.description}"
                                 }

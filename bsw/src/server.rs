@@ -30,6 +30,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::WatchStream;
 
 use crate::hub::Hub;
+use crate::settings::RigSetup;
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
 
@@ -74,14 +75,27 @@ async fn register(
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     Json(registration): Json<Registration>,
 ) -> ApiResult<StatusCode> {
+    fn usable(setup: serde_json::Value) -> Result<RigSetup> {
+        let setup: RigSetup = serde_json::from_value(setup)?;
+        if let Some(calibration) = &setup.calibration {
+            calibration.validate()?;
+        }
+        Ok(setup)
+    }
     check_id(&camera)?;
     let calibration: Calibration =
         serde_json::from_value(registration.calibration).map_err(bad_request)?;
     calibration.validate().map_err(bad_request)?;
+    let setup = registration.setup.and_then(|setup| {
+        usable(setup)
+            .inspect_err(|e| tracing::warn!("ignoring the setup {camera} keeps: {e:#}"))
+            .ok()
+    });
     hub.register(
         &camera,
         address.ip(),
         calibration,
+        setup,
         registration.audio_devices,
     );
     Ok(StatusCode::NO_CONTENT)
@@ -91,10 +105,11 @@ async fn instructions(
     State(hub): State<Arc<Hub>>,
     Path(camera): Path<String>,
     Json(stats): Json<CameraStats>,
-) -> Result<Json<Instructions>, StatusCode> {
+) -> ApiResult<Json<Instructions>> {
     hub.instructions(&camera, &stats)
+        .map_err(internal)?
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or((StatusCode::NOT_FOUND, "camera is not registered".to_owned()))
 }
 
 async fn preview(

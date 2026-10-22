@@ -15,11 +15,21 @@ use crate::recorder::MANIFEST_FILE;
 const RETRY: Duration = Duration::from_secs(10);
 
 pub async fn run(base: BaseStation, root: PathBuf, ready: Arc<Notify>) {
+    let mut registrations = base.registrations();
     loop {
-        if let Err(e) = upload_all(&base, &root).await {
-            tracing::warn!("upload failed: {e:#}");
-            tokio::time::sleep(RETRY).await;
-            continue;
+        registrations.mark_unchanged();
+        tokio::select! {
+            result = upload_all(&base, &root) => {
+                if let Err(e) = result {
+                    tracing::warn!("upload failed: {e:#}");
+                    tokio::time::sleep(RETRY).await;
+                    continue;
+                }
+            }
+            _ = registrations.changed() => {
+                tracing::info!("registered again; starting uploads over");
+                continue;
+            }
         }
         ready.notified().await;
     }

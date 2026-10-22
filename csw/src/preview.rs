@@ -18,11 +18,18 @@ pub struct Inputs {
 }
 
 pub async fn run(base: BaseStation, mut inputs: Inputs) {
+    let mut registrations = base.registrations();
     loop {
-        if let Err(e) = stream(&base, &mut inputs).await {
-            tracing::debug!("preview stream: {e:#}");
+        registrations.mark_unchanged();
+        tokio::select! {
+            result = stream(&base, &mut inputs) => {
+                if let Err(e) = result {
+                    tracing::debug!("preview stream: {e:#}");
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            _ = registrations.changed() => {}
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
         // Don't send stale frames or audio after reconnecting.
         while inputs.frames.try_recv().is_ok() {}
         while inputs.audio.try_recv().is_ok() {}

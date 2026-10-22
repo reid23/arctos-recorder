@@ -96,6 +96,9 @@ pub struct Registration {
     /// The rig's calibration (a `stitching::geometry::Calibration`). Opaque
     /// to the camera.
     pub calibration: serde_json::Value,
+    /// The setup the camera keeps (see [`Instructions::setup`]); `None` if
+    /// it has never been given one.
+    pub setup: Option<serde_json::Value>,
     /// The ALSA capture devices the camera can record audio from.
     pub audio_devices: Vec<AudioDevice>,
 }
@@ -143,6 +146,11 @@ pub struct Instructions {
     /// point is only kept if the camera hears of the point in time, so this
     /// should exceed [`Margins::before`] by how late that may be.
     pub buffer: Duration,
+    /// How the rig is set up (a `bsw` `RigSetup`: its calibration, view,
+    /// blend, and so on), for the camera to keep and send back in
+    /// [`Registration::setup`] so that any base station stitches it the same
+    /// way. Opaque to the camera.
+    pub setup: serde_json::Value,
 }
 
 /// How much footage a camera keeps around each point.
@@ -365,5 +373,12 @@ mod tests {
         assert!(!point.covers(second(116), margins));
         let ongoing = Span { end: None, ..point };
         assert!(ongoing.covers(second(1_000), margins));
+    }
+
+    #[test]
+    fn registrations_from_cameras_that_keep_no_setup_parse() {
+        let registration: Registration =
+            serde_json::from_str(r#"{"calibration": {}, "audio_devices": []}"#).unwrap();
+        assert_eq!(registration.setup, None);
     }
 }

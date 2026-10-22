@@ -198,7 +198,7 @@ fn current_mount(hub: &Hub, camera: &str, link: &CameraLink) -> [Orientation; 2]
         .borrow()
         .cameras
         .get(camera)
-        .and_then(|camera| camera.mount)
+        .and_then(|camera| camera.setup.mount)
         .unwrap_or_else(|| {
             link.reported_calibration
                 .borrow()
@@ -228,8 +228,8 @@ fn FocusStep(camera: String) -> Element {
     let sessions = use_sessions();
     let autofocus = use_channel(&sessions.link.autofocus);
     let settings = use_watch(|hub| &hub.settings);
-    let camera_settings = settings.read().cameras.get(&camera).cloned().unwrap_or_default();
-    let lens_positions = camera_settings.lens_positions.map(|positions| camera_settings.as_shown(positions));
+    let setup = settings.read().cameras.get(&camera).map(|camera| camera.setup.clone()).unwrap_or_default();
+    let lens_positions = setup.lens_positions.map(|positions| setup.as_shown(positions));
     let state = *autofocus.read();
     rsx! {
         p {
@@ -251,7 +251,7 @@ fn FocusStep(camera: String) -> Element {
             AutofocusState::Idle => rsx! {},
             AutofocusState::Requested(_) => rsx! { p { "Focusing… A camera waits until it isn't recording." } },
             AutofocusState::Failed(outcome) => {
-                let focused = camera_settings.as_shown(outcome.lens_positions.map(|position| position.is_some()));
+                let focused = setup.as_shown(outcome.lens_positions.map(|position| position.is_some()));
                 let message = match focused {
                     [false, true] => "The left camera found nothing to focus on.",
                     [true, false] => "The right camera found nothing to focus on.",
@@ -565,7 +565,7 @@ fn MountStep(camera: String) -> Element {
         .read()
         .cameras
         .get(&camera)
-        .is_some_and(|camera| camera.calibration.is_some());
+        .is_some_and(|camera| camera.setup.calibration.is_some());
     let current = stitch.read().calibration.cameras.each_ref().map(|camera| camera.orientation);
     let set = move |side: Side, change: fn(&mut Orientation, f64)| {
         move |e: FormEvent| {
@@ -630,7 +630,7 @@ fn MountStep(camera: String) -> Element {
                     let (hub, camera) = (hub.clone(), camera.clone());
                     move |_| {
                         let mount = draft();
-                        hub.update_settings(|s| s.cameras.entry(camera.clone()).or_default().mount = Some(mount));
+                        hub.update_settings(|s| s.cameras.entry(camera.clone()).or_default().setup.mount = Some(mount));
                     }
                 },
                 "Save mount"
@@ -641,7 +641,7 @@ fn MountStep(camera: String) -> Element {
                     let (hub, camera) = (hub.clone(), camera.clone());
                     move |_| {
                         let mount = draft();
-                        hub.update_settings(|s| s.cameras.entry(camera.clone()).or_default().mount = Some(mount));
+                        hub.update_settings(|s| s.cameras.entry(camera.clone()).or_default().setup.mount = Some(mount));
                         calibrator::change_calibration(&hub, &camera, |calibration| {
                             for (camera, orientation) in calibration.cameras.iter_mut().zip(mount) {
                                 camera.orientation = orientation;
@@ -663,7 +663,7 @@ fn MountStep(camera: String) -> Element {
                 disabled: !calibrated_here,
                 onclick: {
                     let (hub, camera) = (hub.clone(), camera.clone());
-                    move |_| hub.update_settings(|s| s.cameras.entry(camera.clone()).or_default().calibration = None)
+                    move |_| hub.update_settings(|s| s.cameras.entry(camera.clone()).or_default().setup.calibration = None)
                 },
                 "Go back to the camera's calibration"
             }
@@ -792,21 +792,21 @@ fn ViewStep(camera: String) -> Element {
         .read()
         .cameras
         .get(&camera)
-        .is_none_or(|camera| camera.view.is_none());
+        .is_none_or(|camera| camera.setup.view.is_none());
     let set_view = |change: fn(&mut View, f64)| {
         let (hub, camera) = (hub.clone(), camera.clone());
         move |value: f64| {
             hub.update_settings(|s| {
-                let settings = s.cameras.entry(camera.clone()).or_default();
-                let mut changed = settings.view.unwrap_or(view);
+                let setup = &mut s.cameras.entry(camera.clone()).or_default().setup;
+                let mut changed = setup.view.unwrap_or(view);
                 change(&mut changed, value);
-                settings.view = Some(changed);
+                setup.view = Some(changed);
             })
         }
     };
     let set_blend = |change: fn(&mut Blend, f64)| {
         let (hub, camera) = (hub.clone(), camera.clone());
-        move |value: f64| hub.update_settings(|s| change(&mut s.cameras.entry(camera.clone()).or_default().blend, value))
+        move |value: f64| hub.update_settings(|s| change(&mut s.cameras.entry(camera.clone()).or_default().setup.blend, value))
     };
     rsx! {
         div { class: "view-step",
@@ -868,7 +868,7 @@ fn ViewStep(camera: String) -> Element {
                             let (hub, camera) = (hub.clone(), camera.clone());
                             move |value: f64| {
                                 hub.update_settings(|s| {
-                                    s.cameras.entry(camera.clone()).or_default().aspect_ratio = AspectRatio(value)
+                                    s.cameras.entry(camera.clone()).or_default().setup.aspect_ratio = AspectRatio(value)
                                 })
                             }
                         },
@@ -882,7 +882,7 @@ fn ViewStep(camera: String) -> Element {
                         disabled: fitted,
                         onclick: {
                             let (hub, camera) = (hub.clone(), camera.clone());
-                            move |_| hub.update_settings(|s| s.cameras.entry(camera.clone()).or_default().view = None)
+                            move |_| hub.update_settings(|s| s.cameras.entry(camera.clone()).or_default().setup.view = None)
                         },
                         "Fit to the cameras"
                     }
@@ -929,7 +929,7 @@ fn ViewStep(camera: String) -> Element {
                         disabled: blend == Blend::default(),
                         onclick: {
                             let (hub, camera) = (hub.clone(), camera.clone());
-                            move |_| hub.update_settings(|s| s.cameras.entry(camera.clone()).or_default().blend = Blend::default())
+                            move |_| hub.update_settings(|s| s.cameras.entry(camera.clone()).or_default().setup.blend = Blend::default())
                         },
                         "Default blend"
                     }
