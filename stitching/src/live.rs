@@ -8,7 +8,7 @@ use protocol::{Side, rig};
 use turbojpeg::{Compressor, Decompressor, Subsamp, YuvImage};
 
 use crate::geometry::StitchConfig;
-use crate::gpu::{Gpu, Output, OverlayImage, Stitcher, YuvPlanes};
+use crate::gpu::{Gpu, GpuChoice, Output, OverlayImage, Stitcher, YuvPlanes};
 use crate::overlay::PlacedImage;
 
 /// Frame rate of the previews.
@@ -25,16 +25,18 @@ pub struct LiveStitcher {
 }
 
 impl LiveStitcher {
-    /// Stitches `preview_size` previews into `size` panoramas.
-    pub fn new(config: &StitchConfig, preview_size: (u32, u32), size: (u32, u32)) -> Result<Self> {
-        let stitcher = Stitcher::new(&Gpu::shared()?, preview_size, size, Output::Jpeg, config)?;
-        let mut compressor = Compressor::new()?;
-        compressor.set_quality(JPEG_QUALITY)?;
-        compressor.set_subsamp(Subsamp::Sub2x2)?;
+    /// Stitches `preview_size` previews into `size` panoramas on `gpu`.
+    pub fn new(
+        config: &StitchConfig,
+        preview_size: (u32, u32),
+        size: (u32, u32),
+        gpu: GpuChoice,
+    ) -> Result<Self> {
+        let stitcher = Stitcher::new(&Gpu::shared(gpu)?, preview_size, size, Output::Jpeg, config)?;
         Ok(LiveStitcher {
             stitcher,
             preview_size,
-            compressor,
+            compressor: panorama_compressor()?,
             overlay: None,
         })
     }
@@ -52,11 +54,25 @@ impl LiveStitcher {
     }
 
     /// Stitches a pair of previews into a JPEG with `overlay` drawn on top.
-    pub fn stitch(
-        &mut self,
-        frame: &StereoYuv,
-        overlay: Option<&Arc<PlacedImage>>,
-    ) -> Result<Bytes> {
+    /// Waits for the result, so no pair submitted with [`LiveStitcher::start`]
+    /// may still be on the GPU.
+    pub fn stitch(&mut self, frame: &StereoYuv, overlay: Option<&Arc<PlacedImage>>) -> Result<Bytes> {
+        self.prepare(frame, overlay)?;
+        let stitched = self.stitcher.stitch(frame.planes())?;
+        panorama_jpeg(&mut self.compressor, stitched, self.output_size())
+    }
+
+    /// Submits a pair of previews without waiting, so the next pair can be
+    /// uploaded while this one finishes. [`LiveStitcher::take`] reads the
+    /// oldest submitted pair back. The overlay is read when a frame is
+    /// packed, which may be the one already on the GPU, so a new overlay
+    /// can show up one frame early.
+    pub fn start(&mut self, frame: &StereoYuv, overlay: Option<&Arc<PlacedImage>>) -> Result<()> {
+        self.prepare(frame, overlay)?;
+        self.stitcher.start_frame(frame.planes())
+    }
+
+    fn prepare(&mut self, frame: &StereoYuv, overlay: Option<&Arc<PlacedImage>>) -> Result<()> {
         ensure!(
             frame.preview_size() == self.preview_size,
             "the previews are {:?}, not the {:?} being stitched",
@@ -70,26 +86,41 @@ impl LiveStitcher {
         };
         if !unchanged {
             self.overlay = overlay.cloned();
-            self.stitcher
-                .set_overlay(overlay.map(|overlay| OverlayImage {
-                    image: &overlay.image,
-                    position: overlay.position,
-                }));
+            self.stitcher.set_overlay(overlay.map(|overlay| OverlayImage {
+                image: &overlay.image,
+                position: overlay.position,
+            }));
         }
-        let (width, height) = self.stitcher.output_size();
-        let stitched = self.stitcher.stitch(frame.planes())?;
-        let jpeg = self
-            .compressor
-            .compress_yuv_to_vec(YuvImage {
-                pixels: stitched,
-                width: width as usize,
-                align: 1,
-                height: height as usize,
-                subsamp: Subsamp::Sub2x2,
-            })
-            .context("compressing the panorama")?;
-        Ok(jpeg.into())
+        Ok(())
     }
+
+    /// The oldest pair of previews [submitted](LiveStitcher::start), as
+    /// planar YUV 4:2:0.
+    pub fn take(&mut self) -> Result<Vec<u8>> {
+        Ok(self.stitcher.take_frame()?.to_vec())
+    }
+}
+
+pub fn panorama_compressor() -> Result<Compressor> {
+    let mut compressor = Compressor::new()?;
+    compressor.set_quality(JPEG_QUALITY)?;
+    compressor.set_subsamp(Subsamp::Sub2x2)?;
+    Ok(compressor)
+}
+
+/// `yuv` is planar YUV 4:2:0 at `size`, as [`LiveStitcher::take`] returns.
+pub fn panorama_jpeg(compressor: &mut Compressor, yuv: &[u8], size: (u32, u32)) -> Result<Bytes> {
+    let (width, height) = size;
+    let jpeg = compressor
+        .compress_yuv_to_vec(YuvImage {
+            pixels: yuv,
+            width: width as usize,
+            align: 1,
+            height: height as usize,
+            subsamp: Subsamp::Sub2x2,
+        })
+        .context("compressing the panorama")?;
+    Ok(jpeg.into())
 }
 
 /// The size of a pair of preview JPEGs; `None` if they differ, as they do

@@ -45,6 +45,7 @@ fn Camera(id: String) -> Element {
     let status = cameras.read().get(&id).cloned();
     let address = status.as_ref().map(|s| s.address);
     let hearing_audio = status.as_ref().is_some_and(|s| s.hearing_audio);
+    let previews_dropped = status.as_ref().and_then(|s| s.previews_dropped);
     let audio_devices = status.map(|s| s.audio_devices).unwrap_or_default();
     let settings = settings.read();
     let camera = settings.cameras.get(&id).cloned().unwrap_or_default();
@@ -204,6 +205,13 @@ fn Camera(id: String) -> Element {
                     }
                     if !hearing_audio {
                         span { class: "error", "No audio" }
+                    }
+                    if let Some(dropped) = previews_dropped {
+                        span {
+                            class: "muted",
+                            title: "Preview frames dropped in the last 10 seconds because stitching could not keep up",
+                            "Previews dropped {dropped * 100.0:.1}%"
+                        }
                     }
                     button {
                         title: "Calibrate the camera's lenses and alignment, and choose its view and blend",

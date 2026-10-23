@@ -178,9 +178,13 @@ async fn stitch(
     hub.set_job_status(key, JobStatus::Stitching(0.0));
     let stitch = recording.stitch.clone();
     let size = tokio::task::spawn_blocking(move || recording::output_size(&stitch)).await??;
-    let (placement, quality) = {
+    let (placement, quality, gpu) = {
         let settings = hub.settings.borrow();
-        (settings.overlay.clone(), settings.recording.video_quality)
+        (
+            settings.overlay.clone(),
+            settings.recording.video_quality,
+            settings.gpu,
+        )
     };
     let overlay = if placement.enabled {
         Some(OverlayImages::fetch(&hub.arctos, recording, &placement, size).await?)
@@ -192,7 +196,7 @@ async fn stitch(
         Arc::new(move |p| hub.set_job_status(&key, JobStatus::Stitching(p)))
     };
     let (dir, recording) = (dir.to_owned(), recording.clone());
-    tokio::task::spawn_blocking(move || render(&dir, &recording, size, quality, overlay.as_ref(), progress))
+    tokio::task::spawn_blocking(move || render(&dir, &recording, size, quality, gpu, overlay.as_ref(), progress))
         .await??;
     Ok(())
 }

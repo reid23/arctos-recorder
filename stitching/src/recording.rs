@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::encode::{self, Encoder, VideoQuality};
 use crate::geometry::StitchConfig;
-use crate::gpu::{Gpu, Output, OverlayImage, Stitcher};
+use crate::gpu::{Gpu, GpuChoice, Output, OverlayImage, Stitcher};
 use crate::mjpeg::{PairDecoder, PairedFiles};
 use crate::overlay::{Overlay, RgbaImage};
 use crate::priority;
@@ -159,6 +159,7 @@ pub fn render(
     recording: &Recording,
     size: (u32, u32),
     quality: VideoQuality,
+    gpu: GpuChoice,
     overlay: Option<&OverlayImages>,
     progress: Arc<dyn Fn(f32) + Send + Sync>,
 ) -> Result<PathBuf> {
@@ -168,7 +169,7 @@ pub fn render(
             .name("render".into())
             .spawn_scoped(scope, || {
                 priority::lower_this_thread();
-                render_on_this_thread(dir, recording, size, quality, overlay, progress)
+                render_on_this_thread(dir, recording, size, quality, gpu, overlay, progress)
             })?
             .join()
             .map_err(|_| anyhow::anyhow!("rendering panicked"))?
@@ -180,6 +181,7 @@ fn render_on_this_thread(
     recording: &Recording,
     size: (u32, u32),
     quality: VideoQuality,
+    gpu: GpuChoice,
     overlay: Option<&OverlayImages>,
     progress: Arc<dyn Fn(f32) + Send + Sync>,
 ) -> Result<PathBuf> {
@@ -206,7 +208,7 @@ fn render_on_this_thread(
         .peekable();
     let overlay_position = overlay.map_or((0, 0), |overlay| overlay.placement.position(size));
 
-    let gpu = Gpu::shared()?;
+    let gpu = Gpu::shared(gpu)?;
     let mut stitcher = Stitcher::new(&gpu, rig::RECORD_SIZE, size, Output::Video, &recording.stitch)?;
     tracing::info!(width = size.0, height = size.1, "rendering a recording");
     // Rendered under a temporary name so a partial render never counts as

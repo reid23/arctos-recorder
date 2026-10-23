@@ -12,6 +12,7 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use stitching::encode::VideoQuality;
 use stitching::geometry::{AspectRatio, Blend, Calibration, Orientation, StitchConfig, View};
+use stitching::gpu::GpuChoice;
 use stitching::overlay::LiveOverlay;
 use stitching::restream::Destination;
 pub use stitching::overlay::{Align, Overlay};
@@ -21,6 +22,9 @@ pub use stitching::overlay::{Align, Overlay};
 pub struct Settings {
     pub arctos: ArctosSettings,
     pub stitching: Stitching,
+    /// Which GPU stitches live previews and recordings on this computer.
+    /// A computer with one GPU uses it either way.
+    pub gpu: GpuChoice,
     pub cloud: CloudSettings,
     pub workflow: Workflow,
     pub live: LiveSettings,
@@ -332,6 +336,15 @@ mod tests {
         assert_eq!((left.focus, right.focus), (4.0, 9.5));
         assert!((left.fx - nominal.fx * magnification(DEFAULT_FOCUS, 4.0)).abs() < 1e-9);
         assert!((right.fy - nominal.fy * magnification(DEFAULT_FOCUS, 9.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_unset_gpu_is_the_discrete_one() {
+        assert_eq!(Settings::default().gpu, GpuChoice::Discrete);
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.gpu, GpuChoice::Discrete);
+        let settings: Settings = serde_json::from_str(r#"{"gpu": "integrated"}"#).unwrap();
+        assert_eq!(settings.gpu, GpuChoice::Integrated);
     }
 
     #[test]

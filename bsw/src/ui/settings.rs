@@ -5,6 +5,7 @@ use std::time::Duration;
 use dioxus::prelude::*;
 use protocol::rig;
 use stitching::encode::VideoQuality;
+use stitching::gpu::GpuChoice;
 
 use super::controls::NumberSlider;
 use super::{use_hub, use_runtime, use_watch};
@@ -88,6 +89,26 @@ pub fn Settings() -> Element {
                             },
                         }
                         "{label}"
+                    }
+                }
+            }
+            if settings.stitching == Stitching::Local {
+                div { class: "row",
+                    title: "The graphics processor that stitches live previews and recordings on this computer",
+                    "GPU "
+                    for (choice, label) in [(GpuChoice::Discrete, "Discrete"), (GpuChoice::Integrated, "Integrated")] {
+                        label { class: "radio",
+                            input {
+                                r#type: "radio",
+                                name: "gpu",
+                                checked: settings.gpu == choice,
+                                onchange: {
+                                    let hub = hub.clone();
+                                    move |_| hub.update_settings(|s| s.gpu = choice)
+                                },
+                            }
+                            "{label}"
+                        }
                     }
                 }
             }

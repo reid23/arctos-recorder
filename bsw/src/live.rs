@@ -4,13 +4,18 @@
 
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use protocol::Side;
 use stitching::cloud::LiveConfig;
 use stitching::encode::LiveEncoding;
+use stitching::geometry::StitchConfig;
+use stitching::gpu::GpuChoice;
 use stitching::live::{self, LiveStitcher, StereoYuv};
 use stitching::overlay::{self, LiveOverlay, PlacedImage};
 use stitching::restream;
@@ -23,11 +28,14 @@ use turbojpeg::Decompressor;
 
 use crate::cloud::Cloud;
 use crate::hub::{CameraLink, Hub};
+use crate::performance::PreviewDelivery;
 use crate::server::Feed;
 use crate::settings::{Settings, Stitching};
 
 /// Bit rate of the previews forwarded to the cloud server.
 const FORWARD_BITRATE: &str = "6M";
+/// How often the live stitching steps are logged.
+const STITCH_TIMING: Duration = Duration::from_secs(5);
 
 pub fn spawn(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) {
     let runtime = Handle::current();
@@ -86,6 +94,10 @@ async fn show_overlay(
 /// Stitches the previews into [`CameraLink::panorama`] while stitching
 /// locally or calibrating the camera. The GPU is only set up once it is
 /// needed.
+///
+/// Decoding, stitching and compressing each run on their own thread, and
+/// the next frame is uploaded while the previous one finishes on the GPU,
+/// so the preview keeps up with whichever step is slowest.
 fn stitch_locally(
     runtime: &Handle,
     hub: &Hub,
@@ -93,19 +105,121 @@ fn stitch_locally(
     link: &CameraLink,
     overlay: &watch::Receiver<Option<Arc<PlacedImage>>>,
 ) -> Result<()> {
+    let (decoded_tx, decoded_rx) = mpsc::sync_channel(1);
+    let (stitched_tx, stitched_rx) = mpsc::sync_channel(1);
+    let (errors_tx, errors_rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let stitch_errors = errors_tx.clone();
+        std::thread::Builder::new()
+            .name(format!("stitch-{camera}"))
+            .spawn_scoped(scope, move || {
+                if let Err(error) = stitch_decoded(decoded_rx, stitched_tx) {
+                    let _ = stitch_errors.send(error);
+                }
+            })
+            .context("starting stitching")?;
+        let panoramas = link.panorama.clone();
+        let timing_camera = camera.to_owned();
+        std::thread::Builder::new()
+            .name(format!("compress-{camera}"))
+            .spawn_scoped(scope, move || {
+                if let Err(error) = compress_panoramas(&timing_camera, stitched_rx, &panoramas) {
+                    let _ = errors_tx.send(error);
+                }
+            })
+            .context("starting compressing")?;
+        feed_previews(runtime, hub, camera, link, overlay, decoded_tx, &errors_rx)
+    })
+}
+
+struct DecodedPreview {
+    frame: StereoYuv,
+    config: Arc<StitchConfig>,
+    output_size: (u32, u32),
+    gpu: GpuChoice,
+    overlay: Option<Arc<PlacedImage>>,
+    decode: Duration,
+}
+
+struct StitchedPreview {
+    yuv: Vec<u8>,
+    size: (u32, u32),
+    decode: Duration,
+    stitch: Duration,
+}
+
+/// A frame submitted to the GPU and not yet read back.
+struct HeldFrame {
+    decode: Duration,
+    upload: Duration,
+    output_size: (u32, u32),
+}
+
+struct Stitching {
+    stitcher: LiveStitcher,
+    config: Arc<StitchConfig>,
+    gpu: GpuChoice,
+    output_size: (u32, u32),
+    preview_size: (u32, u32),
+    held: Option<HeldFrame>,
+}
+
+impl Stitching {
+    fn open(preview: &DecodedPreview) -> Result<Self> {
+        let preview_size = preview.frame.preview_size();
+        Ok(Stitching {
+            stitcher: LiveStitcher::new(&preview.config, preview_size, preview.output_size, preview.gpu)?,
+            config: Arc::clone(&preview.config),
+            gpu: preview.gpu,
+            output_size: preview.output_size,
+            preview_size,
+            held: None,
+        })
+    }
+}
+
+/// Paced by the left camera; the right one is never more than a frame apart.
+fn feed_previews(
+    runtime: &Handle,
+    hub: &Hub,
+    camera: &str,
+    link: &CameraLink,
+    overlay: &watch::Receiver<Option<Arc<PlacedImage>>>,
+    decoded: mpsc::SyncSender<DecodedPreview>,
+    errors: &mpsc::Receiver<anyhow::Error>,
+) -> Result<()> {
     let mut config = link.stitch.subscribe();
     let mut left = link.previews[Side::Left.index()].subscribe();
     let right = link.previews[Side::Right.index()].subscribe();
-    let mut stitcher: Option<LiveStitcher> = None;
     let mut decompressors = [Decompressor::new()?, Decompressor::new()?];
-    let mut frame: Option<StereoYuv> = None;
+    let mut baseline = link.preview_frames.load(Ordering::Acquire);
+    let mut arrived_total = 0u64;
+    let mut delivered_total = 0u64;
+    let mut preview_delivery = PreviewDelivery::default();
+    let mut publishing = false;
 
     loop {
-        // Paced by the left camera; the right one is never more than a frame apart.
         runtime.block_on(left.changed())?;
-        if hub.settings.borrow().stitching != Stitching::Local
-            && !hub.calibrating.borrow().contains(camera)
-        {
+        if let Ok(error) = errors.try_recv() {
+            return Err(error);
+        }
+        let (publishes, output_size, gpu) = {
+            let settings = hub.settings.borrow();
+            (
+                settings.stitching == Stitching::Local,
+                settings.live_size(camera),
+                settings.gpu,
+            )
+        };
+        let active = publishes || hub.calibrating.borrow().contains(camera);
+        if publishes != publishing {
+            publish_dropped_previews(hub, camera, None);
+            preview_delivery.clear();
+        }
+        publishing = publishes;
+
+        if !active {
+            baseline = link.preview_frames.load(Ordering::Acquire);
             continue;
         }
         let Some(previews) = latest(&mut left, &right) else {
@@ -114,35 +228,185 @@ fn stitch_locally(
         let Some(preview_size) = live::pair_size([&previews[0], &previews[1]])? else {
             continue;
         };
-        let size = hub.settings.borrow().live_size(camera);
-        if stitcher.as_ref().is_some_and(|stitcher| {
-            (stitcher.preview_size(), stitcher.output_size()) != (preview_size, size)
-        }) {
-            stitcher = None;
-        }
-        let stitcher = match &mut stitcher {
-            Some(stitcher) => {
-                if config.has_changed()?
-                    && let Err(e) = stitcher.configure(&config.borrow_and_update())
-                {
-                    tracing::warn!("keeping the last stitching config: {e:#}");
-                }
-                stitcher
-            }
-            None => stitcher.insert(LiveStitcher::new(
-                &config.borrow_and_update(),
-                preview_size,
-                size,
-            )?),
+        let frames_now = link.preview_frames.load(Ordering::Acquire);
+        let mut frame = StereoYuv::new(preview_size);
+        let decode_started = Instant::now();
+        decode(&mut decompressors, &mut frame, &previews)?;
+        let preview = DecodedPreview {
+            frame,
+            config: Arc::clone(&config.borrow_and_update()),
+            output_size,
+            gpu,
+            overlay: overlay.borrow().clone(),
+            decode: decode_started.elapsed(),
         };
-        if frame.as_ref().is_some_and(|frame| frame.preview_size() != preview_size) {
-            frame = None;
+        let arrived = frames_now.saturating_sub(baseline);
+        baseline = frames_now;
+        if decoded.send(preview).is_err() {
+            return Err(stitching_stopped(errors));
         }
-        let frame = frame.get_or_insert_with(|| StereoYuv::new(preview_size));
-        decode(&mut decompressors, frame, &previews)?;
-        let overlay = overlay.borrow().clone();
-        let jpeg = stitcher.stitch(frame, overlay.as_ref())?;
-        link.panorama.send_replace(Some(jpeg));
+        arrived_total += arrived;
+        delivered_total += 1;
+        if publishes
+            && let Some(dropped) = preview_delivery.dropped(Instant::now(), arrived_total, delivered_total)
+        {
+            publish_dropped_previews(hub, camera, Some(dropped));
+        }
+    }
+}
+
+fn stitch_decoded(
+    decoded: mpsc::Receiver<DecodedPreview>,
+    stitched: mpsc::SyncSender<StitchedPreview>,
+) -> Result<()> {
+    let mut current: Option<Stitching> = None;
+    while let Ok(preview) = decoded.recv() {
+        let reusable = current.as_ref().is_some_and(|stitching| {
+            stitching.gpu == preview.gpu
+                && stitching.output_size == preview.output_size
+                && stitching.preview_size == preview.frame.preview_size()
+        });
+        if !reusable {
+            if let Some(stitching) = &mut current {
+                finish_held(stitching, &stitched)?;
+            }
+            current = Some(Stitching::open(&preview)?);
+        }
+        let stitching = current.as_mut().expect("the stitcher was just opened");
+        if stitching.config != preview.config {
+            finish_held(stitching, &stitched)?;
+            if let Err(error) = stitching.stitcher.configure(&preview.config) {
+                tracing::warn!("keeping the last stitching config: {error:#}");
+            }
+            stitching.config = Arc::clone(&preview.config);
+        }
+        let upload_started = Instant::now();
+        stitching.stitcher.start(&preview.frame, preview.overlay.as_ref())?;
+        let upload = upload_started.elapsed();
+        if let Some(held) = stitching.held.take() {
+            let wait_started = Instant::now();
+            let yuv = stitching.stitcher.take()?;
+            stitched
+                .send(StitchedPreview {
+                    yuv,
+                    size: held.output_size,
+                    decode: held.decode,
+                    stitch: held.upload + wait_started.elapsed(),
+                })
+                .map_err(|_| anyhow!("compressing the panorama stopped"))?;
+        }
+        stitching.held = Some(HeldFrame {
+            decode: preview.decode,
+            upload,
+            output_size: preview.output_size,
+        });
+    }
+    if let Some(stitching) = &mut current {
+        finish_held(stitching, &stitched)?;
+    }
+    Ok(())
+}
+
+fn finish_held(stitching: &mut Stitching, stitched: &mpsc::SyncSender<StitchedPreview>) -> Result<()> {
+    let Some(held) = stitching.held.take() else {
+        return Ok(());
+    };
+    let wait_started = Instant::now();
+    let yuv = stitching.stitcher.take()?;
+    stitched
+        .send(StitchedPreview {
+            yuv,
+            size: held.output_size,
+            decode: held.decode,
+            stitch: held.upload + wait_started.elapsed(),
+        })
+        .map_err(|_| anyhow!("compressing the panorama stopped"))?;
+    Ok(())
+}
+
+fn compress_panoramas(
+    camera: &str,
+    stitched: mpsc::Receiver<StitchedPreview>,
+    panoramas: &watch::Sender<Option<Bytes>>,
+) -> Result<()> {
+    let mut compressor = live::panorama_compressor()?;
+    let mut timings = StageTimings::default();
+    while let Ok(preview) = stitched.recv() {
+        let started = Instant::now();
+        let jpeg = live::panorama_jpeg(&mut compressor, &preview.yuv, preview.size)?;
+        timings.record(camera, preview.decode, preview.stitch, started.elapsed());
+        panoramas.send_replace(Some(jpeg));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct StageTimings {
+    decode: Duration,
+    stitch: Duration,
+    compress: Duration,
+    frames: u32,
+    started: Option<Instant>,
+}
+
+impl StageTimings {
+    fn record(&mut self, camera: &str, decode: Duration, stitch: Duration, compress: Duration) {
+        self.decode += decode;
+        self.stitch += stitch;
+        self.compress += compress;
+        self.frames += 1;
+        let started = *self.started.get_or_insert_with(Instant::now);
+        if started.elapsed() < STITCH_TIMING {
+            return;
+        }
+        let frames = f64::from(self.frames);
+        let millis = |duration: Duration| duration.as_secs_f64() * 1e3 / frames;
+        tracing::info!(
+            camera,
+            decode_ms = millis(self.decode),
+            stitch_ms = millis(self.stitch),
+            compress_ms = millis(self.compress),
+            fps = frames / started.elapsed().as_secs_f64(),
+            "live stitching"
+        );
+        *self = StageTimings::default();
+    }
+}
+
+fn publish_dropped_previews(hub: &Hub, camera: &str, dropped: Option<f64>) {
+    hub.cameras.send_if_modified(|cameras| {
+        let Some(status) = cameras.get_mut(camera) else {
+            return false;
+        };
+        let changed = match (status.previews_dropped, dropped) {
+            (Some(before), Some(now)) => (before - now).abs() >= 0.001,
+            (before, now) => before.is_some() != now.is_some(),
+        };
+        if changed {
+            status.previews_dropped = dropped;
+        }
+        changed
+    });
+}
+
+fn stitching_stopped(errors: &mpsc::Receiver<anyhow::Error>) -> anyhow::Error {
+    errors
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap_or_else(|_| anyhow!("live stitching stopped"))
+}
+
+/// Clears the dropped-preview readout when forwarding to the cloud ends,
+/// unless stitching has since moved onto this computer.
+struct ClearDroppedPreviews<'a> {
+    hub: &'a Hub,
+    camera: &'a str,
+}
+
+impl Drop for ClearDroppedPreviews<'_> {
+    fn drop(&mut self) {
+        if self.hub.settings.borrow().stitching == Stitching::Cloud {
+            publish_dropped_previews(self.hub, self.camera, None);
+        }
     }
 }
 
@@ -202,7 +466,7 @@ async fn forward_to_cloud(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) 
         match forwarding {
             None => changed.await,
             Some(forwarding) => tokio::select! {
-                result = forward(&camera, &link, &forwarding) => {
+                result = forward(&hub, &camera, &link, &forwarding) => {
                     if let Err(e) = result {
                         tracing::warn!("forwarding {camera} to the cloud: {e:#}");
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -216,7 +480,8 @@ async fn forward_to_cloud(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) 
 
 /// Forwards the previews until something fails, or until their size changes
 /// and the cloud server must be told.
-async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Result<()> {
+async fn forward(hub: &Hub, camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Result<()> {
+    let _clear = ClearDroppedPreviews { hub, camera };
     let mut left = link.previews[Side::Left.index()].subscribe();
     let right = link.previews[Side::Right.index()].subscribe();
     let preview_size = loop {
@@ -279,6 +544,10 @@ async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Re
     let sink = tokio::sync::Mutex::new(sink);
     let compose = async {
         let mut decoder = ([Decompressor::new()?, Decompressor::new()?], frame);
+        let mut baseline = link.preview_frames.load(Ordering::Acquire);
+        let mut arrived_total = 0u64;
+        let mut delivered_total = 0u64;
+        let mut preview_delivery = PreviewDelivery::default();
         loop {
             left.changed().await?;
             let Some(previews) = latest(&mut left, &right) else {
@@ -292,6 +561,9 @@ async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Re
                 }
                 None => continue,
             }
+            let frames_now = link.preview_frames.load(Ordering::Acquire);
+            let arrived = frames_now.saturating_sub(baseline);
+            baseline = frames_now;
             let decoded;
             (decoded, decoder) = tokio::task::spawn_blocking(move || {
                 let (mut decompressors, mut frame) = decoder;
@@ -300,6 +572,11 @@ async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Re
             })
             .await?;
             decoded?;
+            arrived_total += arrived;
+            delivered_total += 1;
+            if let Some(dropped) = preview_delivery.dropped(Instant::now(), arrived_total, delivered_total) {
+                publish_dropped_previews(hub, camera, Some(dropped));
+            }
             raw.write_all(decoder.1.bytes())
                 .await
                 .context("encoder stopped")?;

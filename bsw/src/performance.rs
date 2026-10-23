@@ -111,6 +111,37 @@ fn share(part: u64, whole: u64) -> Option<f64> {
     (whole > 0).then(|| part as f64 / whole as f64)
 }
 
+/// Preview frames that arrived against those stitched, so the share dropped
+/// can be read off the last [`LOSS_WINDOW`].
+#[derive(Default)]
+pub struct PreviewDelivery {
+    /// Running totals of frames arrived and delivered, oldest first.
+    samples: VecDeque<(Instant, u64, u64)>,
+}
+
+impl PreviewDelivery {
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    /// `arrived` and `delivered` are running totals. The share of arrived
+    /// frames that were not delivered; `None` until a second has passed or
+    /// no frames arrived in the window.
+    pub fn dropped(&mut self, now: Instant, arrived: u64, delivered: u64) -> Option<f64> {
+        self.samples.push_back((now, arrived, delivered));
+        while self.samples.len() > 1 && now.duration_since(self.samples[1].0) >= LOSS_WINDOW {
+            self.samples.pop_front();
+        }
+        let &(start, arrived_then, delivered_then) = self.samples.front().expect("just pushed");
+        let arrived = arrived.saturating_sub(arrived_then);
+        if now.duration_since(start) < Duration::from_secs(1) || arrived == 0 {
+            return None;
+        }
+        let missed = arrived.saturating_sub(delivered.saturating_sub(delivered_then));
+        Some(missed as f64 / arrived as f64)
+    }
+}
+
 /// Samples this computer's use while the Performance pane is open.
 pub async fn track_computer(hub: Arc<Hub>) {
     let mut system = System::new();
@@ -217,5 +248,20 @@ mod tests {
         assert_eq!(losses[0].dropped, None);
         let losses = history.add(start + Duration::from_secs(2), counts(104, 8, 52, 0));
         assert_eq!(losses[0].dropped, Some(2.0 / 56.0));
+    }
+
+    #[test]
+    fn preview_drops_are_the_share_missed_over_the_window() {
+        let start = Instant::now();
+        let mut delivery = PreviewDelivery::default();
+        assert_eq!(delivery.dropped(start, 0, 0), None);
+        assert_eq!(delivery.dropped(start + Duration::from_millis(500), 14, 14), None);
+        assert_eq!(delivery.dropped(start + Duration::from_secs(1), 28, 21), Some(0.25));
+        assert_eq!(delivery.dropped(start + Duration::from_secs(11), 28 * 11, 21 * 11), Some(0.25));
+        assert_eq!(
+            delivery.dropped(start + Duration::from_secs(21), 28 * 11 + 280, 21 * 11 + 280),
+            Some(0.0),
+            "once a quarter was dropped, and then none for the whole window"
+        );
     }
 }

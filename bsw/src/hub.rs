@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -122,6 +123,11 @@ pub struct CameraStatus {
     /// Whether its microphone's audio is arriving.
     pub hearing_audio: bool,
     pub audio_devices: Vec<AudioDevice>,
+    /// Share, from 0 to 1, of preview frames dropped over the last
+    /// [`LOSS_WINDOW`](crate::performance::LOSS_WINDOW) because stitching
+    /// could not keep up. `None` when this computer is not stitching the
+    /// camera's preview.
+    pub previews_dropped: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -148,6 +154,8 @@ pub struct CameraLink {
     pub audio: broadcast::Sender<Bytes>,
     pub last_audio: Mutex<Option<Instant>>,
     pub autofocus: watch::Sender<AutofocusState>,
+    /// Preview frames received from the left camera, which pace the stitched preview.
+    pub preview_frames: AtomicU64,
 }
 
 /// Where autofocusing a camera's lenses is up to.
@@ -268,6 +276,7 @@ impl Hub {
                     audio: broadcast::channel(AUDIO_BACKLOG).0,
                     last_audio: Mutex::new(None),
                     autofocus: watch::Sender::default(),
+                    preview_frames: AtomicU64::new(0),
                 });
                 live::spawn(self.clone(), camera.to_owned(), link.clone());
                 tokio::spawn(restream::run(self.clone(), camera.to_owned(), link.clone()));
@@ -293,6 +302,7 @@ impl Hub {
                     online: true,
                     hearing_audio,
                     audio_devices,
+                    previews_dropped: None,
                 },
             );
         });

@@ -20,7 +20,13 @@ pub fn Performance() -> Element {
         .read()
         .iter()
         .filter(|(_, status)| status.online)
-        .map(|(camera, _)| (camera.clone(), performance.cameras.get(camera).cloned()))
+        .map(|(camera, status)| {
+            (
+                camera.clone(),
+                performance.cameras.get(camera).cloned(),
+                status.previews_dropped,
+            )
+        })
         .collect();
     rsx! {
         fieldset {
@@ -33,11 +39,11 @@ pub fn Performance() -> Element {
         if online.is_empty() {
             p { class: "muted", "No cameras online." }
         }
-        for (camera, usage) in online {
+        for (camera, usage, previews_dropped) in online {
             fieldset { key: "{camera}",
                 legend { "{camera}" }
                 match usage {
-                    Some(usage) => rsx! { Camera { usage } },
+                    Some(usage) => rsx! { Camera { usage, previews_dropped } },
                     None => rsx! { p { class: "muted", "Waiting for its report…" } },
                 }
             }
@@ -61,7 +67,7 @@ fn Computer(usage: ComputerUsage) -> Element {
 }
 
 #[component]
-fn Camera(usage: CameraUsage) -> Element {
+fn Camera(usage: CameraUsage, previews_dropped: Option<f64>) -> Element {
     let window = LOSS_WINDOW.as_secs();
     rsx! {
         match usage.cpu {
@@ -81,6 +87,13 @@ fn Camera(usage: CameraUsage) -> Element {
                 }
             },
             None => rsx! { Unknown { label: "Temperature" } },
+        }
+        if let Some(dropped) = previews_dropped {
+            div { class: "row",
+                title: "Preview frames this computer dropped in the last {window} seconds because stitching could not keep up",
+                span { class: "label", "Stitched previews" }
+                span { "Dropped {dropped * 100.0:.1}%" }
+            }
         }
         table { class: "values losses",
             tr {

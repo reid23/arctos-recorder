@@ -4,6 +4,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -130,6 +131,9 @@ async fn preview(
                     } else {
                         side
                     };
+                    if side == Side::Left {
+                        link.preview_frames.fetch_add(1, Ordering::Release);
+                    }
                     link.previews[side.index()].send_replace(Some(jpeg));
                 }
                 Some(PreviewMessage::Audio(pcm)) => {

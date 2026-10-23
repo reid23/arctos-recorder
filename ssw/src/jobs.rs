@@ -193,7 +193,15 @@ impl Jobs {
             };
             let (render_dir, render_recording, quality) = (dir.clone(), recording.clone(), request.quality);
             tokio::task::spawn_blocking(move || {
-                render(&render_dir, &render_recording, size, quality, overlay.as_ref(), progress)
+                render(
+                    &render_dir,
+                    &render_recording,
+                    size,
+                    quality,
+                    stitching::gpu::GpuChoice::Discrete,
+                    overlay.as_ref(),
+                    progress,
+                )
             })
             .await??;
         }

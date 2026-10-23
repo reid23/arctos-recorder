@@ -11,6 +11,7 @@ use bytes::Bytes;
 use stitching::browser::Chromium;
 use stitching::cloud::LiveConfig;
 use stitching::geometry::StitchConfig;
+use stitching::gpu::GpuChoice;
 use stitching::live::{LiveStitcher, StereoYuv};
 use stitching::overlay::{self, PlacedImage};
 use stitching::restream;
@@ -126,7 +127,12 @@ fn stitch_previews(
     overlay: &watch::Receiver<Option<Arc<PlacedImage>>>,
     panoramas: &watch::Sender<Option<bytes::Bytes>>,
 ) -> Result<()> {
-    let mut stitcher = LiveStitcher::new(&config.borrow_and_update(), preview_size, size)?;
+    let mut stitcher = LiveStitcher::new(
+        &config.borrow_and_update(),
+        preview_size,
+        size,
+        GpuChoice::Discrete,
+    )?;
     let mut frame = StereoYuv::new(preview_size);
     loop {
         runtime

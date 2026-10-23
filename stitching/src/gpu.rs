@@ -25,6 +25,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use anyhow::{Context, Result, bail, ensure};
 use bytemuck::{Pod, Zeroable};
 use protocol::Side;
+use serde::{Deserialize, Serialize};
 
 use crate::geometry::StitchConfig;
 use crate::overlay::RgbaImage;
@@ -39,6 +40,27 @@ const DOWN: [i32; 2] = [0, 1];
 const WORKGROUP_SIZE: u32 = 8;
 /// Frames on the GPU before [`Stitcher::submit`] waits for the oldest.
 const FRAMES_IN_FLIGHT: usize = 2;
+
+/// Which of the computer's GPUs to stitch on. A computer with one GPU uses
+/// it for either choice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuChoice {
+    /// The high-performance GPU.
+    #[default]
+    Discrete,
+    /// The low-power GPU.
+    Integrated,
+}
+
+impl GpuChoice {
+    fn power_preference(self) -> wgpu::PowerPreference {
+        match self {
+            GpuChoice::Discrete => wgpu::PowerPreference::HighPerformance,
+            GpuChoice::Integrated => wgpu::PowerPreference::LowPower,
+        }
+    }
+}
 
 /// A GPU device to stitch on.
 #[derive(Clone)]
@@ -57,21 +79,23 @@ struct UrgentFrames {
 }
 
 impl UrgentFrames {
-    /// Counts a frame until the guard is dropped.
-    fn start(&self) -> UrgentFrame<'_> {
-        *self.count.lock().unwrap() += 1;
-        UrgentFrame(self)
-    }
-
     fn until_none(&self) {
         let count = self.count.lock().unwrap();
         drop(self.none.wait_while(count, |count| *count > 0).unwrap());
     }
 }
 
-struct UrgentFrame<'a>(&'a UrgentFrames);
+/// Counts a frame until dropped.
+struct UrgentGuard(Arc<UrgentFrames>);
 
-impl Drop for UrgentFrame<'_> {
+impl UrgentGuard {
+    fn start(urgent: &Arc<UrgentFrames>) -> Self {
+        *urgent.count.lock().unwrap() += 1;
+        UrgentGuard(Arc::clone(urgent))
+    }
+}
+
+impl Drop for UrgentGuard {
     fn drop(&mut self) {
         let mut count = self.0.count.lock().unwrap();
         *count -= 1;
@@ -82,17 +106,22 @@ impl Drop for UrgentFrame<'_> {
 }
 
 impl Gpu {
-    /// The process's GPU, opened the first time it's asked for.
-    pub fn shared() -> Result<Gpu> {
-        static SHARED: OnceLock<Gpu> = OnceLock::new();
-        if let Some(gpu) = SHARED.get() {
+    /// The process's GPU for `choice`, opened the first time it's asked for.
+    pub fn shared(choice: GpuChoice) -> Result<Gpu> {
+        static DISCRETE: OnceLock<Gpu> = OnceLock::new();
+        static INTEGRATED: OnceLock<Gpu> = OnceLock::new();
+        let opened = match choice {
+            GpuChoice::Discrete => &DISCRETE,
+            GpuChoice::Integrated => &INTEGRATED,
+        };
+        if let Some(gpu) = opened.get() {
             return Ok(gpu.clone());
         }
-        let gpu = Gpu::open()?;
-        Ok(SHARED.get_or_init(|| gpu).clone())
+        let gpu = Gpu::open(choice)?;
+        Ok(opened.get_or_init(|| gpu).clone())
     }
 
-    fn open() -> Result<Gpu> {
+    fn open(choice: GpuChoice) -> Result<Gpu> {
         pollster::block_on(async {
             let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::PRIMARY,
@@ -100,7 +129,7 @@ impl Gpu {
             });
             let adapter = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    power_preference: choice.power_preference(),
                     force_fallback_adapter: false,
                     compatible_surface: None,
                 })
@@ -115,7 +144,7 @@ impl Gpu {
                 .await
                 .context("opening the GPU")?;
             let name = adapter.get_info().name;
-            tracing::info!(gpu = name, "opened the GPU");
+            tracing::info!(gpu = name, ?choice, "opened the GPU");
             Ok(Gpu {
                 device,
                 queue,
@@ -595,11 +624,19 @@ pub struct Stitcher {
     restrict_bind_group: wgpu::BindGroup,
     warp_bind_groups: [wgpu::BindGroup; 2],
     pack_bind_groups: PackBindGroups,
-    /// The staging buffers of frames still on the GPU, oldest first.
-    in_flight: VecDeque<(usize, wgpu::SubmissionIndex)>,
+    /// Frames still on the GPU, oldest first.
+    in_flight: VecDeque<InflightFrame>,
     next_staging: usize,
     /// The frame last read back.
     frame: Vec<u8>,
+}
+
+struct InflightFrame {
+    staging: usize,
+    submission: wgpu::SubmissionIndex,
+    /// Set while a live preview is waiting for this frame, so recordings
+    /// wait their turn.
+    urgent: Option<UrgentGuard>,
 }
 
 impl Stitcher {
@@ -927,7 +964,7 @@ impl Stitcher {
     /// YUV 4:2:0 with colors for the stitcher's [`Output`].
     pub fn submit(&mut self, frames: [YuvPlanes; 2]) -> Result<Option<&[u8]>> {
         self.gpu.urgent.until_none();
-        self.enqueue(frames)?;
+        self.enqueue(frames, false)?;
         if self.in_flight.len() < FRAMES_IN_FLIGHT {
             return Ok(None);
         }
@@ -940,13 +977,28 @@ impl Stitcher {
     /// [finished](Stitcher::finish) first.
     pub fn stitch(&mut self, frames: [YuvPlanes; 2]) -> Result<&[u8]> {
         ensure!(self.in_flight.is_empty(), "earlier frames are still on the GPU");
-        let urgent = self.gpu.urgent.clone();
-        let _urgent = urgent.start();
-        self.enqueue(frames)?;
+        self.enqueue(frames, true)?;
         self.read_oldest()
     }
 
-    fn enqueue(&mut self, frames: [YuvPlanes; 2]) -> Result<()> {
+    /// Submits a pair of frames without waiting, ahead of frames
+    /// [submitted](Stitcher::submit) for recordings. [`Stitcher::take_frame`]
+    /// reads it back. At most [`FRAMES_IN_FLIGHT`] frames may be waiting, so
+    /// the next can be uploaded while the previous one finishes.
+    pub(crate) fn start_frame(&mut self, frames: [YuvPlanes; 2]) -> Result<()> {
+        ensure!(
+            self.in_flight.len() < FRAMES_IN_FLIGHT,
+            "too many frames are already on the GPU"
+        );
+        self.enqueue(frames, true)
+    }
+
+    /// Waits for the oldest frame still on the GPU and returns it.
+    pub(crate) fn take_frame(&mut self) -> Result<&[u8]> {
+        self.read_oldest()
+    }
+
+    fn enqueue(&mut self, frames: [YuvPlanes; 2], urgent: bool) -> Result<()> {
         let (width, height) = self.input_size;
         let luma = (width * height) as usize;
         for (input, frame) in self.inputs.iter().zip(frames) {
@@ -1001,8 +1053,13 @@ impl Stitcher {
         let staging = self.next_staging;
         self.next_staging = (staging + 1) % self.staging.len();
         encoder.copy_buffer_to_buffer(&self.packed, 0, &self.staging[staging], 0, None);
+        let urgent = urgent.then(|| UrgentGuard::start(&self.gpu.urgent));
         let submission = self.gpu.queue.submit([encoder.finish()]);
-        self.in_flight.push_back((staging, submission));
+        self.in_flight.push_back(InflightFrame {
+            staging,
+            submission,
+            urgent,
+        });
         Ok(())
     }
 
@@ -1016,7 +1073,13 @@ impl Stitcher {
     }
 
     fn read_oldest(&mut self) -> Result<&[u8]> {
-        let (staging, submission) = self.in_flight.pop_front().context("no frame on the GPU")?;
+        // `_urgent` stays held through the wait below, so recordings don't
+        // start until this frame has been read back.
+        let InflightFrame {
+            staging,
+            submission,
+            urgent: _urgent,
+        } = self.in_flight.pop_front().context("no frame on the GPU")?;
         let buffer = &self.staging[staging];
         let slice = buffer.slice(..);
         let (sender, receiver) = mpsc::channel();
@@ -1110,7 +1173,7 @@ mod tests {
     }
 
     fn stitch(config: &StitchConfig, frames: [&[u8]; 2]) -> Option<Vec<u8>> {
-        let gpu = match Gpu::shared() {
+        let gpu = match Gpu::shared(GpuChoice::Discrete) {
             Ok(gpu) => gpu,
             Err(error) => {
                 eprintln!("skipping: {error:#}");
@@ -1274,7 +1337,7 @@ mod tests {
     fn background_frames_wait_for_urgent_ones() {
         let urgent = Arc::new(UrgentFrames::default());
         urgent.until_none();
-        let frame = urgent.start();
+        let frame = UrgentGuard::start(&urgent);
         let (waited, waited_rx) = mpsc::channel();
         let waiter = {
             let urgent = urgent.clone();
