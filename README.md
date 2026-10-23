@@ -20,8 +20,8 @@ This system aims to:
 	
 ## Assumptions
 
-- there is a power outlet available.
-- The cell network has 50Mb/s of upload speed.
+- There is a (singular) power outlet available
+- There is cell service.
 
 ## Requirements
 
@@ -32,7 +32,7 @@ The system shall:
 2. capture all play in the footage.
 3. upload footage that is edited to exclude non-game time.
 4. be capable of capturing and uploading five fields worth of video at
-   once on a single Starlink connection
+   once on an internet connection from three or fewer phones
 5. require less than 60 minutes of day-of setup for one person to
    record five fields.
 6. have a BOM cost less than $ 1250 to initially purchase for five
@@ -40,6 +40,7 @@ The system shall:
 8. cost less than $ 25 per tournament day to operate.
 9. not require any existing field infrastructure besides the two bullets
    listed in [[#Assumptions]]
+10. not require any player-supplied hardware.
 
 ### Initial Decisions/Conclusions
 
@@ -64,6 +65,22 @@ It is connected to a PoE (Power over Ethernet) switch, which has
 ethernet cables to a camera rig on each field. The camera rigs run
 the `csw` (camera software) app.
 
+The central computer will be connected to the internet via a cell 
+hotspot. On a field with good cell service, this provides 10-15 Mbps 
+of upload bandwidth, which is enough for one 4-6Mbps live stream 
+plus uploading the recordings. For more fields, options are:
+- bond multiple phone's hotspots together, with openmptcprouter or
+  similar
+- don't live stream and just provide the match recordings
+- just save the match recordings and upload then at the end of the day
+  over wifi
+- some combination of the above
+
+Live streams also look surprisingly decent even at very low bitrates;
+a 2Mbps stream is not out of the question. Especially given that the 
+full-resolution video is still being recorded and published, it's 
+quite good.
+
 The camera rigs will be mounted on 2.7m tripods and spaced at least 1m
 away from the edge of the field. They will have:
 - a Raspberry Pi 5 with 2GB+ RAM
@@ -72,10 +89,15 @@ away from the edge of the field. They will have:
 - a USB microphone
 - a cooling system (copecopecope)
 
-The mounting height and distance were chosen based on the availability of cost-effective tripods; a different height can work but may require a different minimum distance from the field and different camera positions. 
+The mounting height and distance were chosen based on the availability 
+of cost-effective tripods; a different height can work but may require 
+a different minimum distance from the field and different camera 
+positions. Requirement 2 (to capture all play in the footage) means that 
+we need a much taller tripod than normal, because we need to be able to
+see above the near players to the other side of the field.
 
 The system looks like this:
-<img width="1440" height="1920" alt="image" src="https://github.com/user-attachments/assets/18a3816f-19eb-4d7d-87cd-c3da7d7b8fed" />
+<img width="720" alt="camera rig image" src="https://github.com/user-attachments/assets/18a3816f-19eb-4d7d-87cd-c3da7d7b8fed" />
 
 ### BOM
 
@@ -89,7 +111,7 @@ The full hardware BOM is as follows:
 |RPi active cooler|1/field|5.00|[DigiKey](https://www.digikey.com/en/products/detail/raspberry-pi/SC1148/21658255)|
 |USB microphone|1/field|8.99|[Amazon](https://a.co/d/05wimx7k)|
 |100ft ethernet cable|1/field|21.99|[Amazon](https://a.co/d/095YrWB3)|
-|2.7m tripod|1/field|59.99|[Amazon](https://a.co/d/047WDrRC)|
+|2.7m tripod|1/field|28.99|[Amazon](https://a.co/d/0ddiRQrY)|
 |M3x12mm screw|5/field|0.0587|[McMaster](https://www.mcmaster.com/91290A500/)|
 |M2x12mm screw|8/field|0.0587|[McMaster](https://www.mcmaster.com/91292A834/)|
 |M2 hex nut|8/field|0.0306|[McMaster](https://www.mcmaster.com/90591A265/)|
@@ -97,12 +119,18 @@ The full hardware BOM is as follows:
 |1/4"-#20 heat-set threaded insert|1/field|0.25|[Amazon](https://a.co/d/0e3IGgWV)|
 |8-port 120W PoE Switch|1|39.99|[Amazon](https://a.co/d/02OrRrvX)|
 
-plus 3D printed components (CAD coming soon).
+plus 3D printed components (CAD coming soon). These are all the prices 
+that I bought the parts at; they may have changed since.
 
-This gives a theoretical BOM cost of $255.89 per field, plus the 
-39.99 PoE switch. This *is* over the target budget, but not by that 
-much, and I am currently investigating the feasibility of using a 1GB 
-Pi 5, which would bring us *just* under the target cost.
+This gives a theoretical BOM cost of $224.89 per field, plus the 
+39.99 PoE switch. Including taxes and shipping, this is slightly over
+the target budget, but not by that much! I am also currently 
+investigating the feasibility of using a 1GB Pi 5, which cut would 
+costs by $32.50 per field and bring the project safely under budget.
+
+The stated budget *was* set kind of arbitrarily, but having a goal makes 
+sure scope and cost creep don't get the best of me.
+
 
 ### High-Level `csw` logic
 
@@ -168,7 +196,7 @@ example, if the system is powered by a portable battery)
 Okay so there's all the plumbing but there are also some nontrivial
 algorithms to get this stitching to work. I'm totally stealing all
 this from the 106a labs that Kush developed this semester plus cs180
-lab2. i've been relearning all the basic CV stuff so i dont look
+lab2. I've been relearning all the basic CV stuff so i dont look
 clueless when students ask for help...
 
 Anyway. here's what happens live as we stitch:
