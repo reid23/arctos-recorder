@@ -155,7 +155,7 @@ struct HeldFrame {
     output_size: (u32, u32),
 }
 
-struct Stitching {
+struct StitchState {
     stitcher: LiveStitcher,
     config: Arc<StitchConfig>,
     gpu: GpuChoice,
@@ -164,10 +164,10 @@ struct Stitching {
     held: Option<HeldFrame>,
 }
 
-impl Stitching {
+impl StitchState {
     fn open(preview: &DecodedPreview) -> Result<Self> {
         let preview_size = preview.frame.preview_size();
-        Ok(Stitching {
+        Ok(StitchState {
             stitcher: LiveStitcher::new(&preview.config, preview_size, preview.output_size, preview.gpu)?,
             config: Arc::clone(&preview.config),
             gpu: preview.gpu,
@@ -259,7 +259,7 @@ fn stitch_decoded(
     decoded: mpsc::Receiver<DecodedPreview>,
     stitched: mpsc::SyncSender<StitchedPreview>,
 ) -> Result<()> {
-    let mut current: Option<Stitching> = None;
+    let mut current: Option<StitchState> = None;
     while let Ok(preview) = decoded.recv() {
         let reusable = current.as_ref().is_some_and(|stitching| {
             stitching.gpu == preview.gpu
@@ -270,7 +270,7 @@ fn stitch_decoded(
             if let Some(stitching) = &mut current {
                 finish_held(stitching, &stitched)?;
             }
-            current = Some(Stitching::open(&preview)?);
+            current = Some(StitchState::open(&preview)?);
         }
         let stitching = current.as_mut().expect("the stitcher was just opened");
         if stitching.config != preview.config {
@@ -307,7 +307,7 @@ fn stitch_decoded(
     Ok(())
 }
 
-fn finish_held(stitching: &mut Stitching, stitched: &mpsc::SyncSender<StitchedPreview>) -> Result<()> {
+fn finish_held(stitching: &mut StitchState, stitched: &mpsc::SyncSender<StitchedPreview>) -> Result<()> {
     let Some(held) = stitching.held.take() else {
         return Ok(());
     };

@@ -58,8 +58,9 @@ impl LiveStitcher {
     /// may still be on the GPU.
     pub fn stitch(&mut self, frame: &StereoYuv, overlay: Option<&Arc<PlacedImage>>) -> Result<Bytes> {
         self.prepare(frame, overlay)?;
+        let size = self.output_size();
         let stitched = self.stitcher.stitch(frame.planes())?;
-        panorama_jpeg(&mut self.compressor, stitched, self.output_size())
+        panorama_jpeg(&mut self.compressor, stitched, size)
     }
 
     /// Submits a pair of previews without waiting, so the next pair can be
