@@ -25,11 +25,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates ffmpeg libvulkan1 mesa-vulkan-drivers \
+        ca-certificates ffmpeg libvulkan1 libegl1 mesa-vulkan-drivers \
         chromium fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/ssw /usr/local/bin/
-# Graphics for Vulkan stitching, video for NVENC. Chromium (for the live
+# Graphics for Vulkan stitching, video for NVENC. NVIDIA's Vulkan driver
+# will not load without the EGL loader from libegl1. Chromium (for the live
 # scoreboard overlay) runs as root, which its sandbox doesn't allow.
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=all \

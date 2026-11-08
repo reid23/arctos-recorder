@@ -2,12 +2,13 @@
 //! locally or on the cloud server.
 //!
 //! Each recording lives in `recordings/<match id>/<camera>/` (see
-//! [`stitching::recording`]). A recording is stitched (locally into
-//! [`VIDEO_FILE`], or on the cloud server, which uploads it too), then the
-//! video is uploaded. Either step can be held back by the settings until the
-//! user releases it. Each step takes one job at a time, but they run side by
+//! [`stitching::recording`]). Its JPEG files are encoded into MP4s and
+//! deleted, then it is stitched (locally into [`VIDEO_FILE`], or on the
+//! cloud server, which uploads it too), then the video is uploaded.
+//! Stitching and uploading can be held back by the settings until the user
+//! releases them. Each step takes one job at a time, but they run side by
 //! side, so a video can be uploading while the next recording is stitched.
-//! The media is deleted only once the video is on Arctos, leaving
+//! The MP4s and audio are deleted only once the video is on Arctos, leaving
 //! [`RECORDING_FILE`](stitching::recording::RECORDING_FILE) and
 //! [`UPLOADED_FILE`] behind as a record.
 
@@ -108,11 +109,16 @@ fn fail(hub: &Hub, key: &RecordingKey, error: anyhow::Error) {
     hub.set_job_status(key, JobStatus::Failed(format!("{error:#}")));
 }
 
-/// Stitches each recording, or sends it to the cloud server, passing the
-/// videos stitched here on to be uploaded.
+/// Encodes each recording, then stitches it or sends it to the cloud
+/// server, passing the videos stitched here on to be uploaded.
 async fn stitch_each(hub: Arc<Hub>, mut queue: UnboundedReceiver<Step>, uploads: UnboundedSender<Step>) {
     while let Some((order, recording)) = queue.recv().await {
         let key = &order.key;
+        let dir = hub.paths.recording(key);
+        if let Err(error) = encode_videos(&hub, key, &dir, &recording).await {
+            fail(&hub, key, error);
+            continue;
+        }
         let settings = hub.settings.borrow().clone();
         if settings.stitches_later() && !order.release {
             hub.set_job_status(key, JobStatus::StitchLater);
@@ -167,6 +173,24 @@ async fn upload(hub: &Hub, order: &Order, recording: &Recording) -> Result<()> {
         )
         .await?;
     finish(hub, key, &dir, recording)
+}
+
+async fn encode_videos(
+    hub: &Arc<Hub>,
+    key: &RecordingKey,
+    dir: &Path,
+    recording: &Recording,
+) -> Result<()> {
+    hub.set_job_status(key, JobStatus::Encoding(0.0));
+    let (hub, key) = (hub.clone(), key.clone());
+    let (dir, recording) = (dir.to_owned(), recording.clone());
+    tokio::task::spawn_blocking(move || {
+        recording::encode_videos(&dir, &recording, |portion| {
+            hub.set_job_status(&key, JobStatus::Encoding(portion));
+        })
+    })
+    .await??;
+    Ok(())
 }
 
 async fn stitch(

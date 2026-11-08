@@ -17,7 +17,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use protocol::{Span, Timestamp};
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, DATE, HeaderMap, HeaderValue};
 use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -90,13 +90,14 @@ impl Arctos {
         Ok(fields.fields.into_iter().map(|f| f.name).collect())
     }
 
-    /// The match in progress on a field, if any.
+    /// The match in progress on a field, if any, and how far Arctos's clock
+    /// is ahead of this computer.
     pub async fn scoreboard(
         &self,
         tournament: &str,
         field: &str,
         token: &dyn TokenSource,
-    ) -> Result<Option<Scoreboard>> {
+    ) -> Result<Timed<Option<Scoreboard>>> {
         #[derive(Deserialize)]
         struct Response {
             r#match: Option<Scoreboard>,
@@ -106,8 +107,32 @@ impl Arctos {
             encode(tournament),
             encode(field)
         );
-        let response: Response = self.get(&path, token).await?;
-        Ok(response.r#match)
+        let timed: Timed<Response> = self.get_timed(&path, token).await?;
+        Ok(Timed {
+            value: timed.value.r#match,
+            offset: timed.offset,
+        })
+    }
+
+    /// One match's stored status and points. `status` is the lifecycle the
+    /// API reports, which for a static break follows the clock rather than a
+    /// referee ending the match.
+    pub async fn match_progress(
+        &self,
+        tournament: &str,
+        match_id: &str,
+        token: &dyn TokenSource,
+    ) -> Result<Timed<MatchProgress>> {
+        #[derive(Deserialize)]
+        struct Response {
+            r#match: MatchProgress,
+        }
+        let path = format!("/tournaments/{}/matches/{}", encode(tournament), encode(match_id));
+        let timed: Timed<Response> = self.get_timed(&path, token).await?;
+        Ok(Timed {
+            value: timed.value.r#match,
+            offset: timed.offset,
+        })
     }
 
     /// Rendered scoreboard overlay images for every state of a match, each
@@ -231,11 +256,29 @@ impl Arctos {
         path: &str,
         token: &dyn TokenSource,
     ) -> Result<T> {
-        let request = self
+        Ok(self.get_timed(path, token).await?.value)
+    }
+
+    async fn get_timed<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        token: &dyn TokenSource,
+    ) -> Result<Timed<T>> {
+        let token = token.access_token().await?;
+        let started = Utc::now();
+        let response = self
             .http
             .get(format!("{}/api/v1{path}", self.url))
-            .timeout(Duration::from_secs(5));
-        self.send(request, token).await
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        let received = Utc::now();
+        let offset = clock_offset(response.headers(), started, received);
+        Ok(Timed {
+            value: json_response(response).await?,
+            offset,
+        })
     }
 
     async fn send<T: serde::de::DeserializeOwned>(
@@ -262,6 +305,23 @@ pub struct Page {
     pub status: StatusCode,
     pub content_type: Option<HeaderValue>,
     pub body: Bytes,
+}
+
+/// A value read from Arctos, with the clock offset measured on that read.
+pub struct Timed<T> {
+    pub value: T,
+    /// Arctos's clock minus this computer's, in microseconds: the response's
+    /// `Date` minus the midpoint of the request. `None` when `Date` is absent,
+    /// in which case the last offset that was measured still applies.
+    pub offset: Option<i64>,
+}
+
+/// Status and points of one match, as [`Arctos::match_progress`] reads them.
+#[derive(Clone, Debug, Deserialize)]
+pub struct MatchProgress {
+    pub status: String,
+    pub schedule_type: String,
+    pub points: Vec<ScoreboardPoint>,
 }
 
 /// The match in progress on a field.
@@ -333,6 +393,15 @@ pub struct Footage<'a> {
     pub anchors: &'a [Anchor],
 }
 
+/// Arctos's clock minus the local clock, from the `Date` header and the
+/// midpoint of the request.
+fn clock_offset(headers: &HeaderMap, started: DateTime<Utc>, received: DateTime<Utc>) -> Option<i64> {
+    let value = headers.get(DATE)?.to_str().ok()?;
+    let arctos = DateTime::parse_from_rfc2822(value).ok()?.to_utc();
+    let midpoint = started.timestamp_micros() + (received.timestamp_micros() - started.timestamp_micros()) / 2;
+    Some(arctos.timestamp_micros() - midpoint)
+}
+
 async fn json_response<T: serde::de::DeserializeOwned>(response: Response) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
@@ -345,6 +414,17 @@ async fn json_response<T: serde::de::DeserializeOwned>(response: Response) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_offset_is_arctos_minus_the_local_midpoint() {
+        let started = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let received = started + chrono::Duration::seconds(2);
+        let arctos = started + chrono::Duration::seconds(6);
+        let mut headers = HeaderMap::new();
+        headers.insert(DATE, HeaderValue::from_str(&arctos.to_rfc2822()).unwrap());
+        assert_eq!(clock_offset(&headers, started, received), Some(5_000_000));
+        assert_eq!(clock_offset(&HeaderMap::new(), started, received), None);
+    }
 
     #[test]
     fn scoreboard_path_encodes_spaces_as_percent_20() {

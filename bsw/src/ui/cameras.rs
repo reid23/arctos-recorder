@@ -12,18 +12,37 @@ use stitching::overlay::PAGE_SIZE;
 #[component]
 pub fn Cameras() -> Element {
     let cameras = use_watch(|hub| &hub.cameras);
-    let online: Vec<String> = cameras
-        .read()
-        .iter()
-        .filter(|(_, status)| status.online)
-        .map(|(id, _)| id.clone())
-        .collect();
+    let settings = use_watch(|hub| &hub.settings);
+    let fields = use_watch(|hub| &hub.fields);
+    let shown: Vec<String> = {
+        let cameras = cameras.read();
+        let settings = settings.read();
+        let fields = fields.read();
+        cameras
+            .iter()
+            .filter(|(id, status)| {
+                if status.online {
+                    return true;
+                }
+                // A camera that has dropped off the network may still be
+                // recording, and the operator has to be able to finish it.
+                let Some(field) = settings.cameras.get(id.as_str()).and_then(|camera| camera.field.as_deref()) else {
+                    return false;
+                };
+                matches!(
+                    fields.get(field).map(|status| &status.directive),
+                    Some(Directive::Record { .. } | Directive::Finalize { .. })
+                )
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
     rsx! {
-        if online.is_empty() {
+        if shown.is_empty() {
             p { class: "empty", "No cameras on the network. Cameras appear here as soon as they connect." }
         }
         div { class: "camera-grid",
-            for id in online {
+            for id in shown {
                 Camera { key: "{id}", id }
             }
         }
@@ -43,6 +62,7 @@ fn Camera(id: String) -> Element {
     let dragging = use_context::<Signal<Option<Drag>>>();
 
     let status = cameras.read().get(&id).cloned();
+    let online = status.as_ref().is_some_and(|status| status.online);
     let address = status.as_ref().map(|s| s.address);
     let hearing_audio = status.as_ref().is_some_and(|s| s.hearing_audio);
     let audio_devices = status.map(|s| s.audio_devices).unwrap_or_default();
@@ -104,6 +124,9 @@ fn Camera(id: String) -> Element {
                 b { "{id}" }
                 if let Some(address) = address {
                     span { class: "muted", "{address}" }
+                }
+                if !online {
+                    span { class: "muted", "offline" }
                 }
                 label { class: "field",
                     title: "The Arctos field this camera records: it records the field's matches and uploads each \
@@ -245,21 +268,38 @@ fn overlay_style(overlay: &Overlay, view_width: f64) -> String {
 
 #[component]
 fn FieldSummary(status: FieldStatus) -> Element {
+    let hub = use_hub();
     let text = match &status.directive {
         Directive::Idle => "No match in progress".to_owned(),
-        Directive::Record { match_id, play } => {
+        Directive::Record { match_id, play } | Directive::Finalize { match_id, play } => {
             let title = status.match_title.as_deref().unwrap_or(match_id);
             let ongoing = play.last().is_some_and(|span| span.end.is_none());
-            let state = if ongoing {
-                "point in progress"
+            let state = if ongoing { "point in progress" } else { "between points" };
+            let verb = if matches!(status.directive, Directive::Finalize { .. }) {
+                "Finishing"
             } else {
-                "between points"
+                "Recording"
             };
-            format!("Recording {title}: {} points, {state}", play.len())
+            format!("{verb} {title}: {} points, {state}", play.len())
         }
+    };
+    let finish = if let Directive::Record { match_id, .. } = status.directive.clone() {
+        Some(match_id)
+    } else {
+        None
     };
     rsx! {
         p { class: if matches!(status.directive, Directive::Record { .. }) { "recording" }, "{text}" }
+        if let Some(match_id) = finish {
+            button {
+                title: "End this recording and upload what it has. The match on Arctos is left as it is",
+                onclick: {
+                    let hub = hub.clone();
+                    move |_| hub.finish_recording(&match_id)
+                },
+                "Finish recording"
+            }
+        }
         if let Some(error) = status.error {
             p { class: "error", "Can't reach Arctos; following the last known state. {error}" }
         }

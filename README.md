@@ -248,13 +248,15 @@ The workspace has these crates:
   packages bring their own, next to the executable) and a GPU when
   stitching locally.
 - `ssw`: the cloud stitching server, run as a Docker container on a GPU
-  server (see `ssw/Dockerfile`).
+  server (see `ssw/Dockerfile`) or on Modal (see `ssw/app.py`).
 
 ```sh
 just bsw          # run the base station
 just deploy-csw   # install the camera software's package on the Pi (ssh host `ar-sn1`)
 just csw-logs     # follow its logs
 just ssw-image    # build the cloud stitching server's Docker image
+just ssw-serve    # run it on Modal, rebuilding as the code changes
+just ssw-deploy   # deploy it on Modal
 ```
 
 ### The camera network
@@ -350,8 +352,21 @@ Run ssw on a host with an NVIDIA GPU and the NVIDIA Container Toolkit:
 SSW_TOKEN=<secret> docker compose -f ssw/compose.yaml up -d --build
 ```
 
+To run it on Modal, create a secret named `ssw` with `SSW_TOKEN` and,
+when you need them, the `ARCTOS_*` variables from the table above:
+
+```sh
+just ssw-deploy
+```
+
+`just ssw-serve` is that deployment with a temporary URL, rebuilt as the
+code changes. Either command prints an `https://….modal.run` URL. The
+server is one L4 and scales to zero after 20 idle minutes.
+A live preview or an upload keeps it running.
+
 Then, in bsw's Settings, choose "In the cloud" and enter the server URL
-(`http://<host>:7800`, or `https://` behind a TLS proxy) and the token.
+(`http://<host>:7800`, `https://` behind a TLS proxy, or the Modal URL)
+and the token.
 Recordings go up in chunks of at most 64 MiB, so the server can sit
 behind Cloudflare's proxy or a Cloudflare Tunnel, which reject request
 bodies over 100 MB. Recordings are then sent to the

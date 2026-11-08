@@ -88,6 +88,14 @@ impl Side {
             Side::Right => RIGHT_FILE,
         }
     }
+
+    /// The encoded video that replaces [`Self::file_name`].
+    pub fn video_file_name(self) -> &'static str {
+        match self {
+            Side::Left => LEFT_VIDEO,
+            Side::Right => RIGHT_VIDEO,
+        }
+    }
 }
 
 /// Sent by a camera when it (re)connects to the base station.
@@ -123,14 +131,18 @@ pub const DEFAULT_MARGINS: Margins = Margins {
     before: Duration::from_secs(10),
     after: Duration::from_secs(10),
 };
-/// How long cameras hold frames unless told otherwise (see
-/// [`Instructions::buffer`]).
+/// How long cameras keep undecided frames in memory unless told otherwise
+/// (see [`Instructions::buffer`]). Older undecided frames spill to disk.
 pub const DEFAULT_BUFFER: Duration = Duration::from_secs(12);
 
 /// What the base station currently wants a camera to do, polled at 1 Hz.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Instructions {
     pub directive: Directive,
+    /// Base-station time of the Arctos read behind [`Self::directive`].
+    /// Frames newer than this are not discarded. It stays put when that read
+    /// failed, or was of some match other than the one being recorded.
+    pub confirmed_at: Timestamp,
     /// ALSA PCM name of the microphone to capture.
     pub audio_device: String,
     /// JPEG quality (1 to 100) of the frames recorded.
@@ -142,9 +154,8 @@ pub struct Instructions {
     pub preview_quality: u8,
     pub focus: Focus,
     pub margins: Margins,
-    /// How long frames wait to be kept or discarded. Footage from before a
-    /// point is only kept if the camera hears of the point in time, so this
-    /// should exceed [`Margins::before`] by how late that may be.
+    /// How long undecided frames stay in memory. Older ones are kept on disk
+    /// until a confirmation says whether they fall in a point.
     pub buffer: Duration,
     /// How the rig is set up (a `bsw` `RigSetup`: its calibration, view,
     /// blend, and so on), for the camera to keep and send back in
@@ -238,15 +249,21 @@ impl Span {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Directive {
-    /// No match is in progress on the camera's field.
+    /// No match is in progress. Ignored while one is open: a match ends only
+    /// through [`Directive::Finalize`] or because another match starts.
     Idle,
-    /// A match is in progress; keep footage near any of `play`.
+    /// Keep footage near any of `play`. A different open match is finished
+    /// first; footage that `play` does not cover is left for the new one.
     Record { match_id: String, play: Vec<Span> },
+    /// The match is over. Finish it, keeping `play`. A repeat for a match
+    /// that is no longer open is ignored, so losing one poll still ends it.
+    Finalize { match_id: String, play: Vec<Span> },
 }
 
 /// One contiguous run of frames, stored as a directory named after its start
 /// time containing [`LEFT_FILE`], [`RIGHT_FILE`] and (if the match has audio)
-/// [`AUDIO_FILE`].
+/// [`AUDIO_FILE`]. The base station replaces the JPEG files with
+/// [`LEFT_VIDEO`] and [`RIGHT_VIDEO`] before stitching or uploading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Segment {
     /// Timestamp of the first frame.
@@ -269,6 +286,10 @@ impl Segment {
 pub const LEFT_FILE: &str = "left.mjpeg";
 /// Concatenated baseline JPEG frames from the right camera.
 pub const RIGHT_FILE: &str = "right.mjpeg";
+/// The left camera's frames encoded as H.264, which replaces [`LEFT_FILE`].
+pub const LEFT_VIDEO: &str = "left.mp4";
+/// The right camera's frames encoded as H.264, which replaces [`RIGHT_FILE`].
+pub const RIGHT_VIDEO: &str = "right.mp4";
 /// Raw PCM audio (see [`rig::AUDIO_SAMPLE_RATE`]) starting at the segment start.
 pub const AUDIO_FILE: &str = "audio.pcm";
 
@@ -289,10 +310,24 @@ pub struct MatchManifest {
 }
 
 impl MatchManifest {
+    /// The files the camera uploads: a Motion JPEG for each camera, and the
+    /// audio, if recorded.
     pub fn files(&self) -> impl Iterator<Item = (Segment, &'static str)> + '_ {
         let audio: &[&str] = if self.audio { &[AUDIO_FILE] } else { &[] };
         self.segments.iter().flat_map(move |&segment| {
             [LEFT_FILE, RIGHT_FILE]
+                .iter()
+                .chain(audio)
+                .map(move |&file| (segment, file))
+        })
+    }
+
+    /// The files kept once the JPEGs have been encoded: an H.264 MP4 for each
+    /// camera, and the audio, if recorded.
+    pub fn video_files(&self) -> impl Iterator<Item = (Segment, &'static str)> + '_ {
+        let audio: &[&str] = if self.audio { &[AUDIO_FILE] } else { &[] };
+        self.segments.iter().flat_map(move |&segment| {
+            [LEFT_VIDEO, RIGHT_VIDEO]
                 .iter()
                 .chain(audio)
                 .map(move |&file| (segment, file))
@@ -373,6 +408,20 @@ mod tests {
         assert!(!point.covers(second(116), margins));
         let ongoing = Span { end: None, ..point };
         assert!(ongoing.covers(second(1_000), margins));
+    }
+
+    #[test]
+    fn finalize_is_an_end() {
+        let directive = Directive::Finalize {
+            match_id: "m".to_owned(),
+            play: vec![Span {
+                start: Timestamp(1),
+                end: None,
+            }],
+        };
+        let json = serde_json::to_value(&directive).unwrap();
+        assert_eq!(json["state"], "finalize");
+        assert_eq!(serde_json::from_value::<Directive>(json).unwrap(), directive);
     }
 
     #[test]

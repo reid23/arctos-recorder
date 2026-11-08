@@ -1,17 +1,18 @@
 //! Match recordings and rendering them into one stitched video.
 //!
 //! A recording lives in a directory holding the segment directories sent by
-//! the camera, plus [`RECORDING_FILE`] describing it. It is rendered by
-//! stitching every segment's frames one after another into [`VIDEO_FILE`],
-//! which is uploaded to Arctos with an anchor at the start of each segment
-//! so viewers can jump to points.
+//! the camera, plus [`RECORDING_FILE`] describing it. Each segment's JPEG
+//! files are encoded into MP4s and deleted, then it is rendered by stitching
+//! every segment's frames one after another into [`VIDEO_FILE`], which is
+//! uploaded to Arctos with an anchor at the start of each segment so viewers
+//! can jump to points.
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use arctos::{Anchor, Arctos, Footage, OverlayFrame, datetime};
 use chrono::{DateTime, Utc};
 use protocol::{AUDIO_FILE, MatchManifest, Segment, Side, rig};
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::encode::{self, Encoder, VideoQuality};
 use crate::geometry::StitchConfig;
 use crate::gpu::{Gpu, Output, OverlayImage, Stitcher};
-use crate::mjpeg::{PairDecoder, PairedFiles};
+use crate::mjpeg::YuvFrame;
 use crate::overlay::{Overlay, RgbaImage};
 use crate::priority;
 
@@ -149,6 +150,50 @@ impl OverlayImages {
     }
 }
 
+/// Encodes each segment's JPEG files into H.264 MP4s and deletes the JPEGs.
+/// A segment that already has an MP4 is left alone, and a JPEG left beside
+/// it is deleted. Reports progress in `[0, 1]`.
+pub fn encode_videos(dir: &Path, recording: &Recording, progress: impl Fn(f32)) -> Result<()> {
+    let segments = &recording.manifest.segments;
+    let total = segments.len() * Side::BOTH.len();
+    if total == 0 {
+        progress(1.0);
+        return Ok(());
+    }
+    let mut completed = 0;
+    for segment in segments {
+        let source = dir.join(segment.dir_name());
+        for side in Side::BOTH {
+            let jpeg = source.join(side.file_name());
+            let video = source.join(side.video_file_name());
+            if !video.is_file() {
+                if !jpeg.is_file() {
+                    bail!(
+                        "segment {} is missing {}",
+                        segment.dir_name(),
+                        side.file_name()
+                    );
+                }
+                // Removed if encoding fails, so a half-written file never counts as done.
+                let partial = source.join(format!("{}.partial", side.video_file_name()));
+                encode::encode_mjpeg(&jpeg, &partial, rig::FPS, segment.frames, |portion| {
+                    progress((completed as f32 + portion) / total as f32);
+                })
+                .with_context(|| format!("encoding {}", jpeg.display()))?;
+                std::fs::rename(&partial, &video)
+                    .with_context(|| format!("saving {}", video.display()))?;
+            }
+            if jpeg.is_file() {
+                std::fs::remove_file(&jpeg)
+                    .with_context(|| format!("removing {}", jpeg.display()))?;
+            }
+            completed += 1;
+            progress(completed as f32 / total as f32);
+        }
+    }
+    Ok(())
+}
+
 /// Stitches every segment in `dir` into a `size` [`VIDEO_FILE`], with the
 /// overlay (if any) drawn on top and the audio (if recorded), reporting
 /// progress in `[0, 1]`. Blocks for a long time, giving way to live
@@ -213,36 +258,36 @@ fn render_on_this_thread(
     // done.
     let partial = work.join(VIDEO_FILE);
     let mut encoder = Encoder::start(&partial, size, rig::FPS, quality, audio.as_deref())?;
-    let stretches = segments
-        .iter()
-        .map(|segment| {
-            let source = dir.join(segment.dir_name());
-            PairedFiles {
-                files: Side::BOTH.map(|side| source.join(side.file_name())),
-                frames: segment.frames,
+    let frame_count = segments.iter().map(|segment| segment.frames as u64).sum::<u64>();
+    let mut held = [YuvFrame::new(rig::RECORD_SIZE), YuvFrame::new(rig::RECORD_SIZE)];
+    let mut index = 0u64;
+    for segment in segments {
+        let source = dir.join(segment.dir_name());
+        let mut decoder = encode::Mp4Frames::open(
+            Side::BOTH.map(|side| source.join(side.video_file_name())),
+            segment.frames,
+            rig::RECORD_SIZE,
+            &segment.dir_name(),
+        )?;
+        while let Some(pair) = decoder.next_pair()? {
+            while let Some((_, shown)) = overlay_changes.next_if(|&(start, _)| start <= index) {
+                stitcher.set_overlay(shown.map(|shown| OverlayImage {
+                    image: &overlay_images[shown],
+                    position: overlay_position,
+                }));
             }
-        })
-        .collect();
-    let mut decoder = PairDecoder::start(stretches, rig::RECORD_SIZE);
-    let frames = decoder.frames();
-    let mut index = 0;
-    while let Some(pair) = decoder.next_pair() {
-        let pair = pair?;
-        while let Some((_, shown)) = overlay_changes.next_if(|&(start, _)| start <= index) {
-            stitcher.set_overlay(shown.map(|shown| OverlayImage {
-                image: &overlay_images[shown],
-                position: overlay_position,
-            }));
+            for (frame, bytes) in held.iter_mut().zip(pair) {
+                frame.copy_from_yuv(bytes)?;
+            }
+            if let Some(stitched) = stitcher.submit([held[0].planes(), held[1].planes()])? {
+                encoder.write(stitched)?;
+            }
+            index += 1;
+            if frame_count > 0 && index % PROGRESS_INTERVAL == 0 {
+                progress(index as f32 / frame_count as f32);
+            }
         }
-        let [left, right] = &pair;
-        if let Some(stitched) = stitcher.submit([left.planes(), right.planes()])? {
-            encoder.write(stitched)?;
-        }
-        decoder.recycle(pair);
-        index += 1;
-        if index % PROGRESS_INTERVAL == 0 {
-            progress(index as f32 / frames as f32);
-        }
+        decoder.finish()?;
     }
     while let Some(stitched) = stitcher.finish()? {
         encoder.write(stitched)?;

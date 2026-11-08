@@ -126,8 +126,8 @@ impl Gpu {
     }
 }
 
-/// One camera's frame: planar YUV 4:2:0 with full range samples, as
-/// decoded from its JPEGs.
+/// One camera's frame: planar YUV 4:2:0 with full range samples, as the
+/// cameras record them.
 #[derive(Clone, Copy)]
 pub struct YuvPlanes<'a> {
     pub y: &'a [u8],

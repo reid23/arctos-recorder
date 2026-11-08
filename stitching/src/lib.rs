@@ -26,6 +26,8 @@ pub enum JobStatus {
     /// Arriving from the camera, progress in `[0, 1]`.
     Receiving(f32),
     Queued,
+    /// Encoding the camera's JPEG files into MP4s, progress in `[0, 1]`.
+    Encoding(f32),
     /// Saved to be stitched when the user says so.
     StitchLater,
     /// Stitched and saved to be uploaded when the user says so.

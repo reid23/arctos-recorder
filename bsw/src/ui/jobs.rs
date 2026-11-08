@@ -84,6 +84,7 @@ fn JobRow(job: Job) -> Element {
     let (label, progress) = match &job.status {
         JobStatus::Receiving(p) => ("Receiving from camera".to_owned(), Some(*p)),
         JobStatus::Queued => ("Queued".to_owned(), None),
+        JobStatus::Encoding(p) => ("Encoding".to_owned(), Some(*p)),
         JobStatus::StitchLater => ("Waiting to be stitched".to_owned(), None),
         JobStatus::UploadLater => ("Stitched; waiting to be uploaded".to_owned(), None),
         JobStatus::Sending(p) => ("Sending to cloud".to_owned(), Some(*p)),

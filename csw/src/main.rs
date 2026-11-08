@@ -1,8 +1,8 @@
 //! csw: the camera software running on each field's Raspberry Pi.
 //!
 //! Registers with the base station, streams previews to it,
-//! records the play of each match on its field, and uploads the recordings
-//! once the match is over.
+//! records the play of each match on its field, uploads each finished point
+//! while the match goes on, and the rest once the match is over.
 
 mod audio;
 mod base;
@@ -27,7 +27,7 @@ use anyhow::Result;
 use clap::Parser;
 use protocol::{
     DEFAULT_AUDIO_DEVICE, DEFAULT_BUFFER, DEFAULT_MARGINS, DEFAULT_PREVIEW_QUALITY,
-    DEFAULT_RECORD_QUALITY, Directive, Focus, Margins, Registration, rig,
+    DEFAULT_RECORD_QUALITY, Directive, Focus, Margins, Registration, Timestamp, rig,
 };
 use tokio::sync::{Notify, watch};
 use tokio::time::MissedTickBehavior;
@@ -41,6 +41,10 @@ use crate::stats::{FrameCounters, Reporter};
 
 const POLL: Duration = Duration::from_secs(1);
 const RESYNC: Duration = Duration::from_secs(300);
+/// How long instruction polls may fail before the camera looks for the base
+/// station again. A busy Pi misses a poll or two; rediscovering on each of
+/// those restarts the preview.
+const REDISCOVER_AFTER: Duration = Duration::from_secs(15);
 /// Chunks of live audio (about 21 ms each) held while the preview stream
 /// catches up.
 const LIVE_AUDIO_BUFFER: usize = 50;
@@ -81,7 +85,7 @@ async fn main() -> Result<()> {
     let discover = args.base_url.is_none();
     let base = BaseStation::new(args.base_url.unwrap_or_default(), camera);
     let clock = Arc::new(Clock::default());
-    connect(&base, discover, &clock, &calibration, setup.current()).await;
+    connect(&base, discover, &clock, &calibration, setup.current(), true).await;
 
     let recordings = args.data_dir.join("recordings");
     std::fs::create_dir_all(&recordings)?;
@@ -121,7 +125,7 @@ async fn main() -> Result<()> {
     camera::spawn(
         clock.clone(),
         camera::Outputs {
-            recording,
+            recording: recording.clone(),
             record_quality: record_quality.clone(),
             preview_size: preview_size_rx,
             preview_quality: preview_quality.clone(),
@@ -150,6 +154,7 @@ async fn main() -> Result<()> {
         focus,
         margins,
         buffer,
+        recording,
     };
     let reporter = Reporter::new(counters, autofocus_rx);
     follow_instructions(&base, discover, &clock, &calibration, setup, controlled, reporter).await
@@ -165,6 +170,8 @@ struct Controlled {
     focus: watch::Sender<Option<Focus>>,
     margins: watch::Sender<Margins>,
     buffer: watch::Sender<Duration>,
+    /// Set while a match is being recorded. The clock is not stepped then.
+    recording: Arc<AtomicBool>,
 }
 
 /// Syncs clocks and registers, retrying until the base station is reachable.
@@ -174,13 +181,16 @@ async fn connect(
     clock: &Clock,
     calibration: &serde_json::Value,
     setup: Option<&serde_json::Value>,
+    sync_clock: bool,
 ) {
     loop {
         let attempt = async {
             if discover {
                 base.set_url(discovery::base_station_url().await?);
             }
-            base.sync_clock(clock).await?;
+            if sync_clock {
+                base.sync_clock(clock).await?;
+            }
             base.register(&Registration {
                 calibration: calibration.clone(),
                 setup: setup.cloned(),
@@ -207,8 +217,10 @@ async fn connect(
 
 /// Polls the base station for what to do, telling it how the camera is
 /// doing, forwards changes to what the instructions control, and keeps the
-/// rig's setup they carry. If the base station goes away, the last
-/// instructions stay in effect until it is back.
+/// rig's setup they carry. A failed poll keeps the last instructions and
+/// retries; the base station is only rediscovered once it has stayed silent.
+/// The clock is not stepped while a match is recording, so a correction
+/// cannot reorder that match's frames.
 async fn follow_instructions(
     base: &BaseStation,
     discover: bool,
@@ -221,16 +233,21 @@ async fn follow_instructions(
     let mut ticker = tokio::time::interval(POLL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut current = Directive::Idle;
+    let mut confirmed_at = Timestamp(0);
     let mut synced = Instant::now();
+    let mut lost_at: Option<Instant> = None;
     loop {
         ticker.tick().await;
         match base.instructions(&reporter.stats()).await {
             Ok(instructions) => {
-                if instructions.directive != current {
-                    controlled
-                        .recorder
-                        .send(Input::Directive(instructions.directive.clone()))?;
+                lost_at = None;
+                if instructions.directive != current || instructions.confirmed_at != confirmed_at {
+                    controlled.recorder.send(Input::Guide {
+                        directive: instructions.directive.clone(),
+                        confirmed_at: instructions.confirmed_at,
+                    })?;
                     current = instructions.directive;
+                    confirmed_at = instructions.confirmed_at;
                 }
                 controlled.audio_device.send_if_modified(|device| {
                     let changed = *device != instructions.audio_device;
@@ -253,15 +270,26 @@ async fn follow_instructions(
                     tracing::warn!("keeping the rig's setup: {e:#}");
                 }
             }
-            Err(e) => {
-                tracing::warn!("lost the base station: {e:#}");
-                connect(base, discover, clock, calibration, setup.current()).await;
-                synced = Instant::now();
+            Err(error) => {
+                tracing::warn!("instruction poll failed: {error:#}");
+                let lost = lost_at.get_or_insert_with(Instant::now);
+                if lost.elapsed() >= REDISCOVER_AFTER {
+                    tracing::warn!(
+                        "the base station has not answered for {}s; reconnecting",
+                        REDISCOVER_AFTER.as_secs()
+                    );
+                    let recording = controlled.recording.load(Ordering::Relaxed);
+                    connect(base, discover, clock, calibration, setup.current(), !recording).await;
+                    lost_at = None;
+                    if !recording {
+                        synced = Instant::now();
+                    }
+                }
             }
         }
-        if synced.elapsed() > RESYNC {
-            if let Err(e) = base.sync_clock(clock).await {
-                tracing::warn!("clock sync failed: {e:#}");
+        if synced.elapsed() > RESYNC && !controlled.recording.load(Ordering::Relaxed) {
+            if let Err(error) = base.sync_clock(clock).await {
+                tracing::warn!("clock sync failed: {error:#}");
             }
             synced = Instant::now();
         }

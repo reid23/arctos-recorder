@@ -88,6 +88,10 @@ pub struct LiveSettings {
     pub width: u32,
     /// Of the restreams' video, in megabits a second.
     pub bitrate: f64,
+    /// Of each camera's video forwarded to the cloud server, in megabits a
+    /// second.
+    #[serde(default = "default_forward_bitrate")]
+    pub forward_bitrate: f64,
     /// Of the previews the cameras send, one of [`rig::PREVIEW_SIZES`].
     pub camera_size: (u32, u32),
     /// JPEG quality (1 to 100) of the previews the cameras send.
@@ -100,11 +104,16 @@ impl LiveSettings {
     pub const CAMERA_QUALITIES: RangeInclusive<u8> = 20..=100;
 }
 
+fn default_forward_bitrate() -> f64 {
+    6.0
+}
+
 impl Default for LiveSettings {
     fn default() -> Self {
         LiveSettings {
             width: 1280,
             bitrate: 4.0,
+            forward_bitrate: default_forward_bitrate(),
             camera_size: rig::DEFAULT_PREVIEW_SIZE,
             camera_quality: DEFAULT_PREVIEW_QUALITY,
         }
@@ -120,7 +129,8 @@ pub struct RecordingSettings {
     pub camera_quality: u8,
     pub video_quality: VideoQuality,
     pub margins: Margins,
-    /// How long the cameras hold frames (see [`protocol::Instructions::buffer`]).
+    /// How long undecided frames stay in memory on the camera. Older ones
+    /// spill to disk until a confirmation keeps or drops them.
     pub buffer: Duration,
 }
 
@@ -350,5 +360,13 @@ mod tests {
         );
         let resaved = serde_json::to_value(&settings).unwrap();
         assert_eq!(resaved["cameras"]["ar-1"]["lens_positions"], serde_json::json!([9.5, 4.0]));
+    }
+
+    #[test]
+    fn a_saved_settings_file_keeps_the_forward_bitrate() {
+        let settings: Settings = serde_json::from_str(r#"{"live": {"width": 1280, "bitrate": 4.0}}"#).unwrap();
+        assert_eq!(settings.live.bitrate, 4.0);
+        assert_eq!(settings.live.width, 1280);
+        assert_eq!(settings.live.forward_bitrate, 6.0);
     }
 }

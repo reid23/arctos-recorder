@@ -30,12 +30,17 @@ impl Pairer {
     /// Settled frames without a partner are dropped.
     pub fn push(&mut self, frame: CameraFrame) -> Vec<StereoFrame> {
         self.pending[frame.side.index()].insert(frame.timestamp, frame.jpeg);
-        let newest = self
-            .newest
-            .map_or(frame.timestamp, |n| n.max(frame.timestamp));
+        let newest = self.newest.map_or(frame.timestamp, |n| n.max(frame.timestamp));
         self.newest = Some(newest);
-        let settled = newest - SETTLE;
+        self.drain(newest - SETTLE)
+    }
 
+    /// Pairs anything still waiting, including frames inside the settle window.
+    pub fn flush(&mut self) -> Vec<StereoFrame> {
+        self.drain(Timestamp(i64::MAX))
+    }
+
+    fn drain(&mut self, settled: Timestamp) -> Vec<StereoFrame> {
         let mut pairs = Vec::new();
         loop {
             let heads = Side::BOTH.map(|side| {

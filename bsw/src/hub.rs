@@ -30,7 +30,10 @@ use crate::performance::{CameraUsage, FrameHistory, Performance};
 use crate::settings::{RigSetup, Settings};
 use crate::{live, restream};
 
-const ONLINE_TIMEOUT: Duration = Duration::from_secs(3);
+/// A camera is shown as offline when it hasn't polled in this long. Encoding
+/// a match can make a poll take a couple of seconds, so this waits out a few
+/// of those before the preview is taken down.
+const ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Chunks of audio (about 21 ms each) kept for listeners that fall behind.
 const AUDIO_BACKLOG: usize = 64;
 
@@ -61,6 +64,8 @@ pub struct Hub {
     match_titles: Mutex<HashMap<String, String>>,
     /// Recordings arriving from the cameras.
     receiving: Mutex<HashMap<RecordingKey, Transfer>>,
+    /// Matches the operator has asked to stop recording.
+    finish_requests: Mutex<BTreeSet<String>>,
     job_queue: mpsc::UnboundedSender<Order>,
 }
 
@@ -127,6 +132,8 @@ pub struct CameraStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldStatus {
     pub directive: Directive,
+    /// When the directive was confirmed. See [`protocol::Instructions::confirmed_at`].
+    pub confirmed_at: Timestamp,
     pub match_title: Option<String>,
     /// Set while Arctos can't be reached; the last directive stays in effect.
     pub error: Option<String>,
@@ -220,6 +227,7 @@ impl Hub {
             frame_histories: Mutex::default(),
             match_titles: Mutex::default(),
             receiving: Mutex::default(),
+            finish_requests: Mutex::default(),
             job_queue,
         }
     }
@@ -394,10 +402,10 @@ impl Hub {
         let field = settings.cameras.get(camera).and_then(|c| c.field.as_ref());
         let setup = settings.cameras.get(camera).map(|c| c.setup.clone()).unwrap_or_default();
         let fields = self.fields.borrow();
+        let field_status = field.and_then(|field| fields.get(field));
         Ok(Some(Instructions {
-            directive: field
-                .and_then(|field| fields.get(field))
-                .map_or(Directive::Idle, |status| status.directive.clone()),
+            directive: field_status.map_or(Directive::Idle, |status| status.directive.clone()),
+            confirmed_at: field_status.map_or(Timestamp(0), |status| status.confirmed_at),
             audio_device: settings.audio_device(camera).to_owned(),
             record_quality: settings.recording.camera_quality,
             preview_size: settings.live.camera_size,
@@ -407,6 +415,17 @@ impl Hub {
             buffer: settings.recording.buffer,
             setup: serde_json::to_value(setup)?,
         }))
+    }
+
+    /// Ends the recording of `match_id` on the next poll of its field. Arctos
+    /// is left as it is; this is the operator's own confirmation that the
+    /// match is over.
+    pub fn finish_recording(&self, match_id: &str) {
+        self.finish_requests.lock().unwrap().insert(match_id.to_owned());
+    }
+
+    pub(crate) fn take_finish_requests(&self) -> BTreeSet<String> {
+        std::mem::take(&mut *self.finish_requests.lock().unwrap())
     }
 
     pub fn remember_match_title(&self, match_id: &str, title: String) {
@@ -426,21 +445,37 @@ impl Hub {
             .unwrap_or_else(|| match_id.to_owned())
     }
 
-    /// Shows a recording a camera is about to send, `bytes` long, as a job.
+    /// Shows a recording a camera is sending, `bytes` long in all, as a job.
+    /// A later call for the same recording raises the total as more of the
+    /// match is finished.
     pub fn start_receiving(&self, key: RecordingKey, bytes: u64) {
         if self.paths.recording(&key).join(RECORDING_FILE).exists() {
             // The camera didn't hear our acknowledgement and sends it again.
             return;
         }
-        let title = self.match_title(&key.match_id);
-        self.receiving.lock().unwrap().insert(
-            key.clone(),
-            Transfer {
-                received: 0,
-                total: bytes,
-            },
-        );
-        self.show_job(key, title, JobStatus::Receiving(0.0));
+        let updated = {
+            let mut receiving = self.receiving.lock().unwrap();
+            if let Some(transfer) = receiving.get_mut(&key) {
+                transfer.total = transfer.total.max(bytes);
+                Some(transfer.percent())
+            } else {
+                receiving.insert(
+                    key.clone(),
+                    Transfer {
+                        received: 0,
+                        total: bytes,
+                    },
+                );
+                None
+            }
+        };
+        match updated {
+            Some(percent) => self.set_job_status(&key, JobStatus::Receiving(percent as f32 / 100.0)),
+            None => {
+                let title = self.match_title(&key.match_id);
+                self.show_job(key, title, JobStatus::Receiving(0.0));
+            }
+        }
     }
 
     /// Counts `bytes` more of a recording as arrived.

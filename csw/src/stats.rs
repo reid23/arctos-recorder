@@ -150,6 +150,38 @@ fn parse_temperature(text: &str) -> Option<f64> {
     Some(text.trim().parse::<f64>().ok()? / 1000.0)
 }
 
+/// Uploads wait above this share of the CPU, so recording keeps the cores.
+const UPLOAD_CPU_LIMIT: f64 = 0.9;
+/// Uploads wait when less than this much memory is available.
+const UPLOAD_MEMORY_FLOOR: u64 = 200 << 20;
+
+/// Whether the Pi is too busy for an upload to run alongside recording.
+pub struct Pressure {
+    cpu: Option<CpuTimes>,
+}
+
+impl Pressure {
+    pub fn new() -> Self {
+        Pressure { cpu: read_cpu_times() }
+    }
+
+    /// CPU use since the previous check, and the memory available now.
+    pub fn constrained(&mut self) -> bool {
+        let cpu_times = read_cpu_times();
+        let busy = self
+            .cpu
+            .zip(cpu_times)
+            .and_then(|(before, now)| now.busy_share_since(&before));
+        self.cpu = cpu_times;
+        let cpu = busy.is_some_and(|share| share >= UPLOAD_CPU_LIMIT);
+        let memory = std::fs::read_to_string(MEMORY_FILE)
+            .ok()
+            .and_then(|text| parse_memory(&text))
+            .is_some_and(|memory| memory.total.saturating_sub(memory.used) < UPLOAD_MEMORY_FLOOR);
+        cpu || memory
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

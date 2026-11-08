@@ -1,14 +1,14 @@
 //! HTTP client for the base station's camera API.
 
-use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use protocol::{
     CameraStats, Instructions, MatchManifest, Registration, Segment, Timestamp, UploadStart, api,
 };
 use reqwest::{Body, Client};
+use tokio::io::AsyncRead;
 use tokio::sync::watch;
 use tokio_util::io::ReaderStream;
 
@@ -125,11 +125,8 @@ impl BaseStation {
         match_id: &str,
         segment: &Segment,
         file: &str,
-        path: &Path,
+        contents: impl AsyncRead + Send + Unpin + 'static,
     ) -> Result<()> {
-        let contents = tokio::fs::File::open(path)
-            .await
-            .with_context(|| format!("open {}", path.display()))?;
         self.http
             .put(self.endpoint(&api::recording_file(&self.camera, match_id, segment, file)))
             .body(Body::wrap_stream(ReaderStream::with_capacity(

@@ -160,6 +160,18 @@ impl YuvFrame {
         Ok(())
     }
 
+    /// Copies a planar YUV 4:2:0 frame of this frame's size.
+    pub fn copy_from_yuv(&mut self, bytes: &[u8]) -> Result<()> {
+        ensure!(
+            bytes.len() == self.data.len(),
+            "a frame is {} bytes instead of {}",
+            bytes.len(),
+            self.data.len()
+        );
+        self.data.copy_from_slice(bytes);
+        Ok(())
+    }
+
     pub fn planes(&self) -> YuvPlanes<'_> {
         let luma = (self.size.0 * self.size.1) as usize;
         let (y, chroma) = self.data.split_at(luma);

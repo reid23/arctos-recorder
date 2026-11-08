@@ -87,7 +87,7 @@ pub const AUDIO_OUTPUT_ARGS: [&str; 8] = [
 ];
 
 /// ffmpeg arguments holding the video to `bitrate` megabits a second.
-fn bitrate_args(bitrate: f64) -> [String; 6] {
+pub fn bitrate_args(bitrate: f64) -> [String; 6] {
     let kilobits = (bitrate * 1000.0).round() as u64;
     [
         "-b:v".to_owned(),

@@ -26,9 +26,6 @@ use crate::hub::{CameraLink, Hub};
 use crate::server::Feed;
 use crate::settings::{Settings, Stitching};
 
-/// Bit rate of the previews forwarded to the cloud server.
-const FORWARD_BITRATE: &str = "6M";
-
 pub fn spawn(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) {
     let runtime = Handle::current();
     let (overlay_images, overlay_images_rx) = watch::channel(None);
@@ -168,6 +165,7 @@ struct Forwarding {
     destination: restream::Destination,
     size: (u32, u32),
     bitrate: f64,
+    forward_bitrate: f64,
     overlay: Option<LiveOverlay>,
 }
 
@@ -179,6 +177,7 @@ impl Forwarding {
             destination: settings.stream_destination(camera)?,
             size: settings.live_size(camera),
             bitrate: settings.live.bitrate,
+            forward_bitrate: settings.live.forward_bitrate,
             overlay: settings.live_overlay(camera),
         })
     }
@@ -265,7 +264,8 @@ async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Re
         .args(["-map", "0:v"])
         .args(restream::AUDIO_OUTPUT_ARGS)
         .args(encoding.output_args)
-        .args(["-b:v", FORWARD_BITRATE, "-g", &fps, "-color_range", "pc"])
+        .args(restream::bitrate_args(forwarding.forward_bitrate))
+        .args(["-g", &fps, "-color_range", "pc"])
         .args(["-fps_mode", "passthrough", "-f", "mpegts", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

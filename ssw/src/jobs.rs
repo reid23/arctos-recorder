@@ -142,7 +142,7 @@ impl Jobs {
             self.set_status(key, JobStatus::Done);
         } else if dir.join(REQUEST_FILE).exists() {
             let request = load_request(&dir)?;
-            let total = request.recording.manifest.files().count();
+            let total = request.recording.manifest.video_files().count();
             let missing = missing_files(&dir)?.len();
             if missing == 0 {
                 self.set_status(key, JobStatus::Queued);
@@ -239,7 +239,7 @@ fn missing_files(dir: &Path) -> Result<Vec<(Segment, String)>> {
     Ok(request
         .recording
         .manifest
-        .files()
+        .video_files()
         .filter(|(segment, file)| !dir.join(segment.dir_name()).join(file).exists())
         .map(|(segment, file)| (segment, file.to_owned()))
         .collect())

@@ -161,17 +161,49 @@ pub fn Settings() -> Element {
                         move |width: f64| hub.update_settings(|s| s.live.width = (width / 8.0).round() as u32 * 8)
                     },
                 }
-                NumberInput {
-                    label: "Bitrate",
-                    title: "Of the streams' video. Higher looks better but needs a faster upload",
-                    min: *LiveSettings::BITRATES.start(),
-                    max: *LiveSettings::BITRATES.end(),
-                    step: 0.5,
-                    value: settings.live.bitrate,
-                    unit: "Mbps",
-                    onchange: {
-                        let hub = hub.clone();
-                        move |bitrate: f64| hub.update_settings(|s| s.live.bitrate = bitrate)
+                match settings.stitching {
+                    Stitching::Cloud => rsx! {
+                        NumberInput {
+                            label: "Stream bitrate",
+                            title: "Of the restream the cloud server sends. Higher looks better and uses more of the server's connection",
+                            min: *LiveSettings::BITRATES.start(),
+                            max: *LiveSettings::BITRATES.end(),
+                            step: 0.5,
+                            value: settings.live.bitrate,
+                            unit: "Mbps",
+                            onchange: {
+                                let hub = hub.clone();
+                                move |bitrate: f64| hub.update_settings(|s| s.live.bitrate = bitrate)
+                            },
+                        }
+                        NumberInput {
+                            label: "Bitrate to cloud",
+                            title: "Of each camera's video sent to the cloud server for stitching. Higher looks better but needs a faster upload from here",
+                            min: *LiveSettings::BITRATES.start(),
+                            max: *LiveSettings::BITRATES.end(),
+                            step: 0.5,
+                            value: settings.live.forward_bitrate,
+                            unit: "Mbps",
+                            onchange: {
+                                let hub = hub.clone();
+                                move |bitrate: f64| hub.update_settings(|s| s.live.forward_bitrate = bitrate)
+                            },
+                        }
+                    },
+                    Stitching::Local => rsx! {
+                        NumberInput {
+                            label: "Bitrate",
+                            title: "Of the streams' video. Higher looks better but needs a faster upload",
+                            min: *LiveSettings::BITRATES.start(),
+                            max: *LiveSettings::BITRATES.end(),
+                            step: 0.5,
+                            value: settings.live.bitrate,
+                            unit: "Mbps",
+                            onchange: {
+                                let hub = hub.clone();
+                                move |bitrate: f64| hub.update_settings(|s| s.live.bitrate = bitrate)
+                            },
+                        }
                     },
                 }
                 label { class: "row",
@@ -236,10 +268,7 @@ pub fn Settings() -> Element {
                 value: settings.recording.margins.before.as_secs_f64(),
                 decimals: 1,
                 unit: " s",
-                oninput: recording_time(|recording, before| {
-                    recording.margins.before = before;
-                    recording.buffer = recording.buffer.max(before);
-                }),
+                oninput: recording_time(|recording, before| recording.margins.before = before),
             }
             NumberSlider {
                 label: "After points",
@@ -254,11 +283,9 @@ pub fn Settings() -> Element {
             }
             NumberSlider {
                 label: "Camera buffer",
-                title: "How long the cameras hold frames before keeping or discarding them. Footage from before a \
-                        point is only kept if a camera hears that the point started in time, so make this longer \
-                        than \"Before points\" by a couple of seconds, more if Arctos is slow to reach. Longer \
-                        takes more of the cameras' memory",
-                min: settings.recording.margins.before.as_secs_f64().max(*RecordingSettings::BUFFERS.start()),
+                title: "How long a camera keeps undecided frames in memory. Older ones stay on disk until a \
+                        confirmation says whether they fall in a point. Longer uses more memory and less disk",
+                min: *RecordingSettings::BUFFERS.start(),
                 max: *RecordingSettings::BUFFERS.end(),
                 step: 0.5,
                 value: settings.recording.buffer.as_secs_f64(),

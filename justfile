@@ -44,3 +44,11 @@ csw-logs host=pi:
 # Build the cloud stitching server's Docker image.
 ssw-image:
     docker build -f ssw/Dockerfile -t arctos-recorder-ssw .
+
+# Run the cloud stitching server on Modal, rebuilding as the code changes.
+ssw-serve:
+    modal serve ssw/app.py
+
+# Deploy the cloud stitching server on Modal.
+ssw-deploy:
+    modal deploy ssw/app.py
