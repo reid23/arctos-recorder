@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::{Arctos, json_response};
+use crate::Arctos;
 
 pub const REDIRECT_PATH: &str = "/callback";
 /// Lets the recorder upload footage and see unpublished tournaments the
@@ -139,7 +139,7 @@ impl Arctos {
             .form(&[("token", refresh_token), ("client_id", client_id)])
             .send()
             .await?;
-        json_response::<serde_json::Value>(response).await?;
+        self.json_response::<serde_json::Value>(response).await?;
         Ok(())
     }
 
@@ -150,7 +150,7 @@ impl Arctos {
             .bearer_auth(access_token)
             .send()
             .await?;
-        json_response(response).await
+        self.json_response(response).await
     }
 
     async fn token_request(&self, form: &[(&str, &str)]) -> Result<Tokens> {
@@ -160,7 +160,7 @@ impl Arctos {
             .form(form)
             .send()
             .await?;
-        json_response(response).await
+        self.json_response(response).await
     }
 }
 

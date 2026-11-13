@@ -14,6 +14,9 @@ root=$work/root
 rm -rf "$root"
 install -Dm755 "$work/cargo/$target/release/csw" "$root/usr/bin/csw"
 aarch64-linux-gnu-strip "$root/usr/bin/csw"
+software_id=$(sha256sum "$root/usr/bin/csw" | cut -d ' ' -f1)
+printf '%s\n' "$software_id" > "$work/software-id"
+install -Dm644 "$work/software-id" "$root/usr/share/csw/software-id"
 install -Dm644 deploy/csw.service "$root/usr/lib/systemd/system/csw.service"
 install -Dm644 deploy/calibration.json "$root/usr/share/csw/calibration.json"
 

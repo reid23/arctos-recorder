@@ -1,6 +1,7 @@
 //! HTTP server for the cameras' API (see [`protocol::api`]) and the live
 //! feeds shown in the UI and restreamed.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,7 +30,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::WatchStream;
 
-use crate::hub::Hub;
+use crate::hub::{Hub, StereoPreview};
 use crate::settings::RigSetup;
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
@@ -94,6 +95,7 @@ async fn register(
     hub.register(
         &camera,
         address.ip(),
+        registration.software_id,
         calibration,
         setup,
         registration.audio_devices,
@@ -106,10 +108,17 @@ async fn instructions(
     Path(camera): Path<String>,
     Json(stats): Json<CameraStats>,
 ) -> ApiResult<Json<Instructions>> {
-    hub.instructions(&camera, &stats)
-        .map_err(internal)?
-        .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, "camera is not registered".to_owned()))
+    if let Ok(bytes) = serde_json::to_vec(&stats) {
+        hub.network.camera_received(&camera, bytes.len() as u64);
+    }
+    let instructions = hub.instructions(&camera, &stats).map_err(internal)?;
+    let Some(instructions) = instructions else {
+        return Err((StatusCode::NOT_FOUND, "camera is not registered".to_owned()));
+    };
+    if let Ok(bytes) = serde_json::to_vec(&instructions) {
+        hub.network.camera_sent(&camera, bytes.len() as u64);
+    }
+    Ok(Json(instructions))
 }
 
 async fn preview(
@@ -119,18 +128,27 @@ async fn preview(
 ) -> Result<Response, StatusCode> {
     let link = hub.link(&camera).ok_or(StatusCode::NOT_FOUND)?;
     Ok(upgrade.on_upgrade(move |mut socket| async move {
+        let mut pairer = PreviewPairer::default();
         while let Some(Ok(message)) = socket.recv().await {
             let Message::Binary(message) = message else {
                 continue;
             };
+            hub.network.camera_received(&camera, message.len() as u64);
             match PreviewMessage::decode(message) {
-                Some(PreviewMessage::Frame(PreviewFrame { side, jpeg })) => {
+                Some(PreviewMessage::Frame(PreviewFrame {
+                    side,
+                    timestamp: frame_timestamp,
+                    jpeg,
+                })) => {
                     let side = if hub.settings.borrow().swaps_sides(&camera) {
                         side.opposite()
                     } else {
                         side
                     };
-                    link.previews[side.index()].send_replace(Some(jpeg));
+                    link.previews[side.index()].send_replace(Some(jpeg.clone()));
+                    for preview in pairer.push(side, frame_timestamp, jpeg) {
+                        let _ = link.live.send(preview);
+                    }
                 }
                 Some(PreviewMessage::Audio(pcm)) => {
                     *link.last_audio.lock().unwrap() = Some(Instant::now());
@@ -140,6 +158,76 @@ async fn preview(
             }
         }
     }))
+}
+
+#[derive(Default)]
+struct PreviewPairer {
+    pending: [BTreeMap<Timestamp, Bytes>; 2],
+    newest: Option<Timestamp>,
+    legacy: [Option<Bytes>; 2],
+}
+
+impl PreviewPairer {
+    fn push(
+        &mut self,
+        side: Side,
+        timestamp: Timestamp,
+        jpeg: Bytes,
+    ) -> Vec<StereoPreview> {
+        if timestamp == Timestamp(0) {
+            self.legacy[side.index()] = Some(jpeg);
+            if self.legacy.iter().any(Option::is_none) {
+                return Vec::new();
+            }
+            let [left, right] = &mut self.legacy;
+            return vec![StereoPreview {
+                jpegs: [
+                    left.take().expect("checked"),
+                    right.take().expect("checked"),
+                ],
+            }];
+        }
+        if self
+            .newest
+            .is_some_and(|newest| newest.micros_since(timestamp) > 500_000)
+        {
+            self.pending = Default::default();
+            self.newest = None;
+        }
+        self.pending[side.index()].insert(timestamp, jpeg);
+        self.newest = Some(self.newest.map_or(timestamp, |newest| newest.max(timestamp)));
+        let mut pairs = Vec::new();
+        loop {
+            let heads = Side::BOTH.map(|side| {
+                self.pending[side.index()]
+                    .first_key_value()
+                    .map(|(&timestamp, _)| timestamp)
+            });
+            if let [Some(left), Some(right)] = heads
+                && left.micros_since(right).abs() <= rig::frame_micros() / 2
+            {
+                let [left_frames, right_frames] = &mut self.pending;
+                let (_, left) = left_frames.pop_first().expect("head exists");
+                let (_, right) = right_frames.pop_first().expect("head exists");
+                pairs.push(StereoPreview { jpegs: [left, right] });
+                continue;
+            }
+            let (oldest_side, oldest) = match heads {
+                [Some(left), Some(right)] if left < right => (Side::Left, left),
+                [Some(_), Some(right)] => (Side::Right, right),
+                [Some(left), None] => (Side::Left, left),
+                [None, Some(right)] => (Side::Right, right),
+                [None, None] => return pairs,
+            };
+            if self
+                .newest
+                .is_none_or(|newest| newest.micros_since(oldest) < 500_000)
+            {
+                return pairs;
+            }
+            self.pending[oldest_side.index()].pop_first();
+        }
+    }
 }
 
 async fn start_upload(
@@ -181,6 +269,7 @@ async fn upload_file(
         let chunk = chunk.map_err(bad_request)?;
         out.write_all(&chunk).await.map_err(internal)?;
         hub.received(&key, chunk.len() as u64);
+        hub.network.camera_received(&key.camera, chunk.len() as u64);
     }
     out.sync_all().await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)

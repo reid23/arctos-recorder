@@ -146,36 +146,115 @@ pub struct PlacedImage {
 }
 
 /// Keeps `images` showing the live scoreboard described by `config`, placed
-/// on a frame of the size given with it. Returns once `config` closes.
+/// on a frame of the size given with it. The scoreboard page stays open
+/// between changes: a new position redraws the last screenshot, a new width
+/// rescales the page and takes one immediately, and only a different
+/// tournament or field loads another page. Returns once `config` closes.
 pub async fn follow_live(
     arctos: &Arctos,
     chromium: &Chromium,
     mut config: watch::Receiver<Option<(LiveOverlay, (u32, u32))>>,
     images: &watch::Sender<Option<Arc<PlacedImage>>>,
 ) {
+    let mut page: Option<browser::Page> = None;
+    let mut shown: Option<(String, String, f64)> = None;
+    let mut image: Option<Arc<RgbaImage>> = None;
+    let mut failures = 0;
+    let mut interval = tokio::time::interval(SCREENSHOT_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+
     loop {
         let current = config.borrow_and_update().clone();
-        images.send_replace(None);
-        let changed = match current {
-            Some((current, video)) => tokio::select! {
-                never = show_live(arctos, chromium, &current, images, video) => never,
-                changed = config.changed() => changed,
-            },
-            None => config.changed().await,
+        let Some((overlay, video)) = current else {
+            images.send_replace(None);
+            page = None;
+            shown = None;
+            image = None;
+            failures = 0;
+            if config.changed().await.is_err() {
+                return;
+            }
+            continue;
         };
-        if changed.is_err() {
-            return;
+
+        let scale = overlay.placement.scale(video);
+        let different_page = page.is_none()
+            || shown.as_ref().is_none_or(|(tournament, field, _)| {
+                tournament != &overlay.tournament || field != &overlay.field
+            });
+        let mut take_screenshot = false;
+        if different_page {
+            match open_page(arctos, chromium, &overlay, scale).await {
+                Ok(opened) => {
+                    page = Some(opened);
+                    shown = Some((overlay.tournament.clone(), overlay.field.clone(), scale));
+                    failures = 0;
+                    take_screenshot = true;
+                }
+                Err(error) => {
+                    tracing::warn!("showing the live scoreboard of {}: {error:#}", overlay.field);
+                    page = None;
+                    shown = None;
+                    tokio::select! {
+                        changed = config.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                        () = tokio::time::sleep(RETRY_INTERVAL) => {}
+                    }
+                    continue;
+                }
+            }
+        } else if shown.as_ref().is_some_and(|(_, _, shown_scale)| *shown_scale != scale) {
+            let rescaled = match page.as_mut() {
+                Some(page) => page.set_scale(PAGE_SIZE, scale).await,
+                None => Ok(()),
+            };
+            if let Err(error) = rescaled {
+                tracing::warn!("rescaling the live scoreboard of {}: {error:#}", overlay.field);
+                page = None;
+                shown = None;
+                continue;
+            }
+            shown = Some((overlay.tournament.clone(), overlay.field.clone(), scale));
+            take_screenshot = true;
+        }
+
+        if let Some(image) = &image {
+            publish(images, image, &overlay, video);
+        }
+        if take_screenshot {
+            if !capture(&mut page, &mut image, &mut failures, images, &overlay, video).await {
+                page = None;
+                shown = None;
+            }
+            interval.reset();
+        }
+
+        tokio::select! {
+            changed = config.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = interval.tick() => {
+                if !capture(&mut page, &mut image, &mut failures, images, &overlay, video).await {
+                    page = None;
+                    shown = None;
+                }
+            }
         }
     }
 }
 
-async fn show_live(
+async fn open_page(
     arctos: &Arctos,
     chromium: &Chromium,
     overlay: &LiveOverlay,
-    images: &watch::Sender<Option<Arc<PlacedImage>>>,
-    video: (u32, u32),
-) -> ! {
+    scale: f64,
+) -> Result<browser::Page> {
     let url = format!(
         "{}{}",
         arctos.url(),
@@ -186,41 +265,56 @@ async fn show_live(
         .iter()
         .filter_map(|(name, value)| Some((name.to_string(), value.to_str().ok()?.to_owned())))
         .collect();
-    let position = overlay.placement.position(video);
-    let show = async || -> Result<()> {
-        let mut page = browser::Page::open(
-            chromium,
-            &url,
-            &headers,
-            PAGE_SIZE,
-            overlay.placement.scale(video),
-        )
-        .await?;
-        let mut interval = tokio::time::interval(SCREENSHOT_INTERVAL);
-        let mut failures = 0;
-        loop {
-            interval.tick().await;
-            match page.screenshot().await.and_then(|png| RgbaImage::decode_png(&png)) {
-                Ok(image) => {
-                    failures = 0;
-                    images.send_replace(Some(Arc::new(PlacedImage { image, position })));
-                }
-                Err(e) => {
-                    failures += 1;
-                    if failures == SCREENSHOT_FAILURES {
-                        return Err(e);
-                    }
-                }
+    browser::Page::open(chromium, &url, &headers, PAGE_SIZE, scale).await
+}
+
+/// Replaces `image` with a screenshot. `false` once that has failed
+/// [`SCREENSHOT_FAILURES`] times in a row and the page should be opened again.
+async fn capture(
+    page: &mut Option<browser::Page>,
+    image: &mut Option<Arc<RgbaImage>>,
+    failures: &mut u32,
+    images: &watch::Sender<Option<Arc<PlacedImage>>>,
+    overlay: &LiveOverlay,
+    video: (u32, u32),
+) -> bool {
+    let Some(page) = page.as_mut() else {
+        return false;
+    };
+    match page.screenshot().await.and_then(|png| RgbaImage::decode_png(&png)) {
+        Ok(shot) => {
+            *failures = 0;
+            let shot = Arc::new(shot);
+            publish(images, &shot, overlay, video);
+            *image = Some(shot);
+            true
+        }
+        Err(error) => {
+            *failures += 1;
+            if *failures == SCREENSHOT_FAILURES {
+                tracing::warn!("showing the live scoreboard of {}: {error:#}", overlay.field);
+                false
+            } else {
+                true
             }
         }
-    };
-    loop {
-        if let Err(e) = show().await {
-            tracing::warn!("showing the live scoreboard of {}: {e:#}", overlay.field);
-        }
-        images.send_replace(None);
-        tokio::time::sleep(RETRY_INTERVAL).await;
     }
+}
+
+fn publish(
+    images: &watch::Sender<Option<Arc<PlacedImage>>>,
+    image: &RgbaImage,
+    overlay: &LiveOverlay,
+    video: (u32, u32),
+) {
+    images.send_replace(Some(Arc::new(PlacedImage {
+        image: RgbaImage {
+            width: image.width,
+            height: image.height,
+            pixels: image.pixels.clone(),
+        },
+        position: overlay.placement.position(video),
+    })));
 }
 
 #[cfg(test)]

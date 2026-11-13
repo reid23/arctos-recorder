@@ -342,7 +342,16 @@ fn encode_mjpeg_file(
         .args(["-fps_mode", "passthrough", "-an"])
         // The panorama is encoded again at the user's quality, so this copy stays fine.
         .args(codec.full_range_output_args(VideoQuality::VeryHigh))
-        .args(["-color_range", "pc", "-movflags", "+faststart", "-progress", "pipe:1"])
+        .args([
+            "-color_range",
+            "pc",
+            "-movflags",
+            "+faststart",
+            "-progress",
+            "pipe:1",
+            "-f",
+            "mp4",
+        ])
         .arg(output)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

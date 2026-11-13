@@ -1,6 +1,6 @@
-// Moving between the blend's levels. Each level is either the same size as
-// the next finer one or half its size (rounding up), its texel c lying at
-// the finer level's texel 2c.
+// Moving between the blend's levels. Each level is half the size of the
+// next finer one (rounding up), its texel c lying at the finer level's
+// texel 2c.
 
 // Below this coverage a premultiplied color is treated as empty.
 const MIN_COVERAGE: f32 = 0.001;
@@ -21,17 +21,9 @@ fn expand_weight(odd: bool, offset: i32) -> f32 {
     return select(0.125, 0.75, offset == 0);
 }
 
-// The next coarser level `coarse` at `pixel` of a level `size` texels big,
-// unpremultiplying each texel first if `premultiplied`: expanded if it's
-// half the size, as it is otherwise.
-fn upsample(coarse: texture_2d<f32>, pixel: vec2<i32>, size: vec2<u32>, premultiplied: bool) -> vec3<f32> {
-    if all(textureDimensions(coarse) == size) {
-        let texel = textureLoad(coarse, pixel, 0);
-        if premultiplied {
-            return unpremultiply(texel);
-        }
-        return texel.xyz;
-    }
+// The next coarser level `coarse` expanded at `pixel` of the finer one,
+// unpremultiplying each texel first if `premultiplied`.
+fn upsample(coarse: texture_2d<f32>, pixel: vec2<i32>, premultiplied: bool) -> vec3<f32> {
     let last = vec2<i32>(textureDimensions(coarse)) - 1;
     let half = pixel / 2;
     let odd = (pixel % 2) == vec2<i32>(1);

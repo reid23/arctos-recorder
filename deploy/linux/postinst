@@ -5,6 +5,9 @@
 set -e
 
 if [ "$1" = configure ] && command -v ufw > /dev/null; then
+    ufw delete allow proto udp from 10.77.0.0/24 to any port 7701 > /dev/null || true
+    ufw delete allow proto tcp from 10.77.0.0/24 to any port 7700 > /dev/null || true
+    ufw delete allow proto udp from 10.77.0.0/24 to any port 69 > /dev/null || true
     ufw allow proto udp from 169.254.0.0/16 to any port 7701 comment 'Arctos Recorder cameras' > /dev/null
     ufw allow proto tcp from 169.254.0.0/16 to any port 7700 comment 'Arctos Recorder cameras' > /dev/null
 fi

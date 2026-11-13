@@ -2,6 +2,7 @@
 
 use std::io::SeekFrom;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -13,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_util::io::ReaderStream;
 
+use crate::network::ByteCounter;
 use crate::settings::CloudSettings;
 
 #[derive(Clone)]
@@ -20,26 +22,24 @@ pub struct Cloud {
     http: Client,
     url: String,
     authorization: String,
+    traffic: Arc<ByteCounter>,
 }
 
 impl Cloud {
-    pub fn new(settings: &CloudSettings) -> Self {
+    pub fn new(settings: &CloudSettings, traffic: Arc<ByteCounter>) -> Self {
         Cloud {
             http: Client::new(),
             url: settings.url.trim_end_matches('/').to_owned(),
             authorization: format!("Bearer {}", settings.token),
+            traffic,
         }
     }
 
     pub async fn put_job(&self, key: &RecordingKey, request: &JobRequest) -> Result<JobState> {
-        Ok(self
-            .request(self.http.put(self.endpoint(&cloud::job(key))))
-            .json(request)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        let body = serde_json::to_vec(request)?;
+        let sent = body.len() as u64;
+        self.exchange(self.http.put(self.endpoint(&cloud::job(key))).body(body), sent)
+            .await
     }
 
     /// The job's state; `None` if the server doesn't know about it.
@@ -48,18 +48,27 @@ impl Cloud {
             .request(self.http.get(self.endpoint(&cloud::job(key))))
             .send()
             .await?;
-        if response.status() == StatusCode::NOT_FOUND {
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        self.traffic.add_received(bytes.len() as u64);
+        if status == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        Ok(Some(response.error_for_status()?.json().await?))
+        if !status.is_success() {
+            anyhow::bail!("the cloud server returned {status}");
+        }
+        Ok(Some(serde_json::from_slice(&bytes)?))
     }
 
     pub async fn put_token(&self, key: &RecordingKey, access_token: &str) -> Result<()> {
-        self.request(self.http.put(self.endpoint(&cloud::token(key))))
+        self.traffic.add_sent(access_token.len() as u64);
+        let response = self
+            .request(self.http.put(self.endpoint(&cloud::token(key))))
             .body(access_token.to_owned())
             .send()
             .await?
             .error_for_status()?;
+        self.traffic.add_received(response.bytes().await?.len() as u64);
         Ok(())
     }
 
@@ -79,19 +88,24 @@ impl Cloud {
             let mut contents = tokio::fs::File::open(file).await?;
             contents.seek(SeekFrom::Start(offset)).await?;
             let sent = sent.clone();
+            let traffic = self.traffic.clone();
             let contents =
                 ReaderStream::with_capacity(contents.take(length), 1 << 20).inspect(move |data| {
                     if let Ok(data) = data {
-                        sent(data.len() as u64);
+                        let bytes = data.len() as u64;
+                        sent(bytes);
+                        traffic.add_sent(bytes);
                     }
                 });
-            self.request(self.http.put(self.endpoint(path)))
+            let response = self
+                .request(self.http.put(self.endpoint(path)))
                 .query(&FileChunk { offset, size })
                 .header(CONTENT_LENGTH, length)
                 .body(Body::wrap_stream(contents))
                 .send()
                 .await?
                 .error_for_status()?;
+            self.traffic.add_received(response.bytes().await?.len() as u64);
             offset += length;
             if offset == size {
                 return Ok(());
@@ -122,6 +136,23 @@ impl Cloud {
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}{path}", self.url)
+    }
+
+    async fn exchange<T: serde::de::DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+        sent: u64,
+    ) -> Result<T> {
+        self.traffic.add_sent(sent);
+        let bytes = self
+            .request(request)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        self.traffic.add_received(bytes.len() as u64);
+        Ok(serde_json::from_slice(&bytes)?)
     }
 }
 
@@ -164,10 +195,13 @@ mod tests {
         let file =
             std::env::temp_dir().join(format!("bsw-upload-test-{size}-{}", std::process::id()));
         std::fs::File::create(&file).unwrap().set_len(size).unwrap();
-        let cloud = Cloud::new(&CloudSettings {
-            url,
-            token: "token".into(),
-        });
+        let cloud = Cloud::new(
+            &CloudSettings {
+                url,
+                token: "token".into(),
+            },
+            Arc::default(),
+        );
         let sent = Arc::new(AtomicU64::new(0));
         let count = {
             let sent = sent.clone();

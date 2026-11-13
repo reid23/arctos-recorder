@@ -14,6 +14,7 @@ mod fields;
 mod hub;
 mod jobs;
 mod live;
+mod network;
 mod performance;
 mod restream;
 mod server;
@@ -39,12 +40,11 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let paths = Paths::new(
-        dirs::data_local_dir()
-            .context("no data directory")?
-            .join("arctos-recorder"),
-    )?;
-    let settings = Settings::load(&paths.settings())?;
+    let root = dirs::data_local_dir()
+        .context("no data directory")?
+        .join("arctos-recorder");
+    let settings = Settings::load(&root.join("settings.json"))?;
+    let paths = Paths::new(root.clone(), settings.recordings_directory(&root))?;
     let arctos = Arctos::from_env()?;
     let account = Account::load(arctos.clone(), paths.account())?;
     let (job_queue, jobs) = mpsc::unbounded_channel();
@@ -93,6 +93,7 @@ async fn backend(hub: Arc<Hub>, jobs: mpsc::UnboundedReceiver<Order>) {
     tokio::spawn(fields::run(hub.clone()));
     tokio::spawn(hub.clone().track_presence());
     tokio::spawn(performance::track_computer(hub.clone()));
+    tokio::spawn(network::track(hub.clone()));
     if cfg!(target_os = "linux") {
         tokio::spawn(camera_port::follow(hub.clone()));
     }

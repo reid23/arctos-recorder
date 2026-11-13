@@ -9,6 +9,7 @@ if [ "$1" = configure ]; then
     fi
     systemctl enable csw.service
     if [ -d /run/systemd/system ]; then
+        systemctl disable --now arctos-recovery-agent.service 2>/dev/null || true
         systemctl daemon-reload
         systemctl restart csw.service
     fi

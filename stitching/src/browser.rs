@@ -312,6 +312,17 @@ impl Page {
         Ok(page)
     }
 
+    /// Renders the open page at `scale` device pixels per CSS pixel, still
+    /// laid out at `size` CSS pixels.
+    pub async fn set_scale(&mut self, size: (u32, u32), scale: f64) -> Result<()> {
+        self.call(
+            "Emulation.setDeviceMetricsOverride",
+            json!({ "width": size.0, "height": size.1, "deviceScaleFactor": scale, "mobile": false }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Navigates to `url`, returning once it has loaded: until then there's
     /// no page to take screenshots of.
     async fn navigate(&mut self, url: &str) -> Result<()> {

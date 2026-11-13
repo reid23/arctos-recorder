@@ -1,8 +1,8 @@
 //! csw: the camera software running on each field's Raspberry Pi.
 //!
 //! Registers with the base station, streams previews to it,
-//! records the play of each match on its field, uploads each finished point
-//! while the match goes on, and the rest once the match is over.
+//! records the play of each match on its field, and uploads finished
+//! recordings once the match is over.
 
 mod audio;
 mod base;
@@ -20,11 +20,11 @@ mod upload;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
+use crossbeam_channel::{Sender, bounded};
 use protocol::{
     DEFAULT_AUDIO_DEVICE, DEFAULT_BUFFER, DEFAULT_MARGINS, DEFAULT_PREVIEW_QUALITY,
     DEFAULT_RECORD_QUALITY, Directive, Focus, Margins, Registration, Timestamp, rig,
@@ -39,6 +39,8 @@ use crate::recorder::{Input, Recorder};
 use crate::setup::KeptSetup;
 use crate::stats::{FrameCounters, Reporter};
 
+const SOFTWARE_ID_FILE: &str = "/usr/share/csw/software-id";
+
 const POLL: Duration = Duration::from_secs(1);
 const RESYNC: Duration = Duration::from_secs(300);
 /// How long instruction polls may fail before the camera looks for the base
@@ -48,6 +50,10 @@ const REDISCOVER_AFTER: Duration = Duration::from_secs(15);
 /// Chunks of live audio (about 21 ms each) held while the preview stream
 /// catches up.
 const LIVE_AUDIO_BUFFER: usize = 50;
+/// Half a second of live messages at the in-match rate.
+const LIVE_VIDEO_BUFFER: usize = (rig::FPS / 2) as usize;
+/// Bounds encoded frames waiting for the recorder to about one second.
+const RECORDER_INPUTS: usize = 128;
 
 #[derive(Parser)]
 struct Args {
@@ -81,18 +87,30 @@ async fn main() -> Result<()> {
         .to_owned();
     let calibration: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&args.calibration)?)?;
+    let software_id = std::fs::read_to_string(SOFTWARE_ID_FILE)
+        .ok()
+        .map(|software_id| software_id.trim().to_owned());
     let setup = KeptSetup::load(args.data_dir.join(setup::FILE));
     let discover = args.base_url.is_none();
     let base = BaseStation::new(args.base_url.unwrap_or_default(), camera);
     let clock = Arc::new(Clock::default());
-    connect(&base, discover, &clock, &calibration, setup.current(), true).await;
+    connect(
+        &base,
+        discover,
+        &clock,
+        &calibration,
+        software_id.as_deref(),
+        setup.current(),
+        true,
+    )
+    .await;
 
     let recordings = args.data_dir.join("recordings");
     std::fs::create_dir_all(&recordings)?;
     let recording = Arc::new(AtomicBool::new(false));
     let capturing_audio = Arc::new(AtomicBool::new(false));
     let uploads = Arc::new(Notify::new());
-    let (inputs, inputs_rx) = mpsc::channel();
+    let (inputs, inputs_rx) = bounded(RECORDER_INPUTS);
     let (margins, margins_rx) = watch::channel(DEFAULT_MARGINS);
     let (buffer, buffer_rx) = watch::channel(DEFAULT_BUFFER);
     Recorder {
@@ -115,7 +133,7 @@ async fn main() -> Result<()> {
             capturing: capturing_audio,
         },
     );
-    let (previews, previews_rx) = tokio::sync::mpsc::channel(4);
+    let (previews, previews_rx) = tokio::sync::mpsc::channel(LIVE_VIDEO_BUFFER);
     let record_quality = Arc::new(AtomicU8::new(DEFAULT_RECORD_QUALITY));
     let (preview_size, preview_size_rx) = watch::channel(rig::DEFAULT_PREVIEW_SIZE);
     let preview_quality = Arc::new(AtomicU8::new(DEFAULT_PREVIEW_QUALITY));
@@ -143,7 +161,12 @@ async fn main() -> Result<()> {
             audio: live_audio_rx,
         },
     ));
-    tokio::spawn(upload::run(base.clone(), recordings, uploads));
+    tokio::spawn(upload::run(
+        base.clone(),
+        recordings,
+        uploads,
+        recording.clone(),
+    ));
 
     let controlled = Controlled {
         recorder: inputs,
@@ -157,7 +180,17 @@ async fn main() -> Result<()> {
         recording,
     };
     let reporter = Reporter::new(counters, autofocus_rx);
-    follow_instructions(&base, discover, &clock, &calibration, setup, controlled, reporter).await
+    follow_instructions(
+        &base,
+        discover,
+        &clock,
+        &calibration,
+        software_id,
+        setup,
+        controlled,
+        reporter,
+    )
+    .await
 }
 
 /// What the base station's instructions control.
@@ -180,6 +213,7 @@ async fn connect(
     discover: bool,
     clock: &Clock,
     calibration: &serde_json::Value,
+    software_id: Option<&str>,
     setup: Option<&serde_json::Value>,
     sync_clock: bool,
 ) {
@@ -192,6 +226,7 @@ async fn connect(
                 base.sync_clock(clock).await?;
             }
             base.register(&Registration {
+                software_id: software_id.map(str::to_owned),
                 calibration: calibration.clone(),
                 setup: setup.cloned(),
                 audio_devices: audio::devices(),
@@ -226,6 +261,7 @@ async fn follow_instructions(
     discover: bool,
     clock: &Clock,
     calibration: &serde_json::Value,
+    software_id: Option<String>,
     mut setup: KeptSetup,
     controlled: Controlled,
     mut reporter: Reporter,
@@ -238,7 +274,7 @@ async fn follow_instructions(
     let mut lost_at: Option<Instant> = None;
     loop {
         ticker.tick().await;
-        match base.instructions(&reporter.stats()).await {
+        match base.instructions(&reporter.stats(&base.url())).await {
             Ok(instructions) => {
                 lost_at = None;
                 if instructions.directive != current || instructions.confirmed_at != confirmed_at {
@@ -279,7 +315,16 @@ async fn follow_instructions(
                         REDISCOVER_AFTER.as_secs()
                     );
                     let recording = controlled.recording.load(Ordering::Relaxed);
-                    connect(base, discover, clock, calibration, setup.current(), !recording).await;
+                    connect(
+                        base,
+                        discover,
+                        clock,
+                        calibration,
+                        software_id.as_deref(),
+                        setup.current(),
+                        !recording,
+                    )
+                    .await;
                     lost_at = None;
                     if !recording {
                         synced = Instant::now();

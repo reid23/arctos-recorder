@@ -10,6 +10,7 @@ mod calibration;
 mod cameras;
 mod controls;
 mod jobs;
+mod network;
 mod performance;
 mod settings;
 
@@ -143,26 +144,45 @@ fn arctos_url(path: &str) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
     Cameras,
+    Network,
     Jobs,
     Settings,
     Performance,
 }
 
 impl Pane {
-    const ALL: [Pane; 4] = [Pane::Cameras, Pane::Jobs, Pane::Settings, Pane::Performance];
+    const ALL: [Pane; 5] = [
+        Pane::Cameras,
+        Pane::Network,
+        Pane::Jobs,
+        Pane::Settings,
+        Pane::Performance,
+    ];
 
     fn title(self) -> &'static str {
         match self {
             Pane::Cameras => "Cameras",
+            Pane::Network => "Network Usage",
             Pane::Jobs => "Jobs",
             Pane::Settings => "Settings",
             Pane::Performance => "Performance",
         }
     }
 
+    fn css(self) -> &'static str {
+        match self {
+            Pane::Cameras => "cameras",
+            Pane::Network => "network",
+            Pane::Jobs => "jobs",
+            Pane::Settings => "settings",
+            Pane::Performance => "performance",
+        }
+    }
+
     fn menu_id(self) -> &'static str {
         match self {
             Pane::Cameras => "pane-cameras",
+            Pane::Network => "pane-network",
             Pane::Jobs => "pane-jobs",
             Pane::Settings => "pane-settings",
             Pane::Performance => "pane-performance",
@@ -172,6 +192,7 @@ impl Pane {
     fn open_flag(self, panes: &mut Panes) -> &mut bool {
         match self {
             Pane::Cameras => &mut panes.cameras,
+            Pane::Network => &mut panes.network,
             Pane::Jobs => &mut panes.jobs,
             Pane::Settings => &mut panes.settings,
             Pane::Performance => &mut panes.performance,
@@ -181,6 +202,7 @@ impl Pane {
     fn is_open(self, panes: &Panes) -> bool {
         match self {
             Pane::Cameras => panes.cameras,
+            Pane::Network => panes.network,
             Pane::Jobs => panes.jobs,
             Pane::Settings => panes.settings,
             Pane::Performance => panes.performance,
@@ -228,10 +250,15 @@ fn App() -> Element {
     // Pane sizes while a splitter is dragged; saved when it is let go.
     let mut resized = use_signal(|| None::<Panes>);
     let mut workspace = use_signal(|| None::<Rc<MountedData>>);
+    let mut column = use_signal(|| None::<Rc<MountedData>>);
     let mut side = use_signal(|| None::<Rc<MountedData>>);
 
     let panes = resized().unwrap_or(settings.read().panes);
     let closable = open_count(&panes) > 1;
+    let column_open = panes.cameras || panes.network;
+    let both_column = panes.cameras && panes.network;
+    let cameras_flex = if both_column { panes.cameras_share } else { 1.0 };
+    let network_flex = if both_column { 1.0 - panes.cameras_share } else { 1.0 };
     let side_open = panes.settings || panes.jobs;
     let both_side_panes = panes.settings && panes.jobs;
     let (settings_flex, jobs_flex) = if both_side_panes {
@@ -249,6 +276,7 @@ fn App() -> Element {
                     s.panes.settings_share = sizes.settings_share;
                     s.panes.camera_width = sizes.camera_width;
                     s.panes.performance_width = sizes.performance_width;
+                    s.panes.cameras_share = sizes.cameras_share;
                 });
             }
         }
@@ -272,8 +300,13 @@ fn App() -> Element {
             }
             Splitter::Performance => {
                 let width = point.x - area.min_x() - WORKSPACE_PADDING;
-                let side = if panes.cameras && side_open { panes.side_width } else { 0.0 };
+                let side = if column_open && side_open { panes.side_width } else { 0.0 };
                 sizes.performance_width = width.clamp(MIN_PANE_SIZE, widest(side));
+            }
+            Splitter::Network => {
+                let share = (point.y - area.min_y()) / area.height();
+                let least = (MIN_PANE_SIZE / area.height()).min(0.5);
+                sizes.cameras_share = share.clamp(least, 1.0 - least);
             }
             Splitter::Settings => {
                 let share = (point.y - area.min_y()) / area.height();
@@ -289,7 +322,7 @@ fn App() -> Element {
     let workspace_class = match dragging().map(|drag| drag.splitter) {
         None => "workspace",
         Some(Splitter::Side | Splitter::Performance) => "workspace dragging columns",
-        Some(Splitter::Settings) => "workspace dragging rows",
+        Some(Splitter::Settings | Splitter::Network) => "workspace dragging rows",
         Some(Splitter::CameraCorner) => "workspace dragging corner",
     };
     rsx! {
@@ -317,11 +350,36 @@ fn App() -> Element {
                     }
                 }
             }
-            if panes.cameras {
-                PaneFrame { pane: Pane::Cameras, closable, cameras::Cameras {} }
+            if column_open {
+                div {
+                    class: "camera-column",
+                    onmounted: move |e| column.set(Some(e.data())),
+                    if panes.cameras {
+                        PaneFrame {
+                            pane: Pane::Cameras,
+                            closable,
+                            style: "flex: {cameras_flex}",
+                            cameras::Cameras {}
+                        }
+                    }
+                    if both_column {
+                        div {
+                            class: "splitter rows",
+                            onmousedown: move |_| start_drag(dragging, Splitter::Network, column()),
+                        }
+                    }
+                    if panes.network {
+                        PaneFrame {
+                            pane: Pane::Network,
+                            closable,
+                            style: "flex: {network_flex}",
+                            network::NetworkUsage {}
+                        }
+                    }
+                }
             }
             if side_open {
-                if panes.cameras {
+                if column_open {
                     div {
                         class: "splitter columns",
                         onmousedown: move |_| start_drag(dragging, Splitter::Side, workspace()),
@@ -375,6 +433,8 @@ enum Splitter {
     Side,
     /// Right of Performance.
     Performance,
+    /// Between Cameras and Network Usage.
+    Network,
     /// Between Settings and Jobs.
     Settings,
     /// A camera's box's bottom right corner, which resizes every camera's
@@ -408,7 +468,7 @@ fn PaneFrame(
     children: Element,
 ) -> Element {
     let hub = use_hub();
-    let class = format!("pane {}", pane.title().to_lowercase());
+    let class = format!("pane {}", pane.css());
     rsx! {
         section { class, style,
             div { class: "pane-title",

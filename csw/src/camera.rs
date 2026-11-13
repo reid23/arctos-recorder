@@ -2,10 +2,9 @@
 //!
 //! The ISP produces two streams per frame: the full recording resolution and
 //! a preview of the size the base station asks for. One thread owns
-//! libcamera and recycles requests. As the previews are the live stream,
-//! each camera has a thread of its own encoding them, which then hands the
-//! frames to a pool encoding the full-resolution ones (the Pi 5 has no
-//! hardware JPEG encoder).
+//! libcamera and recycles requests. While recording, every second recording
+//! JPEG is also sent live without another encode. While idle, each camera
+//! has a thread encoding every fourth preview frame.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -33,7 +32,7 @@ use crate::recorder::{CameraFrame, Input};
 use crate::stats::FrameCounters;
 
 /// Frame buffers per stream per camera; bounds how far encoding may lag.
-const BUFFERS: u32 = 12;
+const BUFFERS: u32 = 8;
 /// Threads encoding the full-resolution frames of both cameras.
 const RECORD_ENCODERS: usize = 4;
 /// How long autofocusing may take before the cameras still scanning count
@@ -53,8 +52,8 @@ pub struct Outputs {
     /// says.
     pub focus: watch::Receiver<Option<Focus>>,
     pub autofocus: watch::Sender<Option<AutofocusOutcome>>,
-    pub frames: std::sync::mpsc::Sender<Input>,
-    pub previews: tokio::sync::mpsc::Sender<PreviewFrame<Vec<u8>>>,
+    pub frames: Sender<Input>,
+    pub previews: tokio::sync::mpsc::Sender<PreviewFrame<Arc<[u8]>>>,
     pub counters: Arc<FrameCounters>,
 }
 
@@ -89,6 +88,8 @@ struct Job {
     request: Request,
     /// Whether the full-resolution frame is to be encoded.
     record: bool,
+    /// Whether the encoded frame is also sent live.
+    preview: bool,
 }
 
 fn capture(encoder: Arc<Encoder>) -> Result<()> {
@@ -116,11 +117,11 @@ fn capture(encoder: Arc<Encoder>) -> Result<()> {
         .into_iter()
         .map(|side| {
             let (jobs_tx, jobs) = unbounded();
-            let (records, events, encoder) = (record_jobs_tx.clone(), events_tx.clone(), encoder.clone());
+            let (events, encoder) = (events_tx.clone(), encoder.clone());
             thread::Builder::new()
                 .name(format!("preview-{side:?}").to_lowercase())
                 .spawn(move || {
-                    let error = encoder.run_previews(jobs, records, events).unwrap_err();
+                    let error = encoder.run_previews(jobs, events).unwrap_err();
                     tracing::error!("preview encoder failed: {error:#}");
                     std::process::exit(1);
                 })?;
@@ -160,19 +161,26 @@ fn capture(encoder: Arc<Encoder>) -> Result<()> {
                     encoder.outputs.autofocus.send_replace(Some(outcome));
                 }
                 let complete = request.status() == RequestStatus::Complete;
-                let preview = complete && request.sequence().is_multiple_of(rig::PREVIEW_DECIMATION);
+                let record = complete && encoder.outputs.recording.load(Ordering::Relaxed);
+                let preview_decimation = if record {
+                    rig::RECORD_PREVIEW_DECIMATION
+                } else {
+                    rig::IDLE_PREVIEW_DECIMATION
+                };
+                let preview = complete && request.sequence().is_multiple_of(preview_decimation);
                 let job = Job {
                     side,
                     streams: rigs[side.index()].streams,
                     request,
-                    record: complete && encoder.outputs.recording.load(Ordering::Relaxed),
+                    record,
+                    preview,
                 };
-                if preview {
+                if job.record {
+                    record_jobs_tx.send(job).map_err(|_| anyhow!("encoders stopped"))?;
+                } else if job.preview {
                     preview_jobs[side.index()]
                         .send(job)
                         .map_err(|_| anyhow!("preview encoders stopped"))?;
-                } else if job.record {
-                    record_jobs_tx.send(job).map_err(|_| anyhow!("encoders stopped"))?;
                 } else {
                     rigs[side.index()].requeue(job.request)?;
                 }
@@ -544,42 +552,48 @@ impl Encoder {
     fn run_records(&self, jobs: Receiver<Job>, events: Sender<Event>) -> Result<()> {
         let mut compressor = Compressor::new()?;
         for job in jobs {
-            self.encode_record(&mut compressor, &job)?;
+            let frame = self.encode_record(&mut compressor, &job)?;
             events
                 .send(Event::Encoded(job.side, job.request))
                 .map_err(|_| anyhow!("capture stopped"))?;
+            if job.preview {
+                let sent = self
+                    .outputs
+                    .previews
+                    .try_send(PreviewFrame {
+                        side: frame.side,
+                        timestamp: frame.timestamp,
+                        jpeg: Arc::clone(&frame.jpeg),
+                    })
+                    .is_ok();
+                self.outputs.counters.count_preview(frame.side, sent);
+            }
+            self.outputs.frames.send(Input::Frame(frame))?;
         }
         bail!("job channel closed")
     }
 
-    /// Encodes one camera's previews, then passes their frames on to be
-    /// recorded or given back.
-    fn run_previews(&self, jobs: Receiver<Job>, records: Sender<Job>, events: Sender<Event>) -> Result<()> {
-        let pass_on = |job: Job| {
-            if job.record {
-                records.send(job).map_err(|_| anyhow!("encoders stopped"))
-            } else {
-                events
-                    .send(Event::Encoded(job.side, job.request))
-                    .map_err(|_| anyhow!("capture stopped"))
-            }
-        };
+    fn run_previews(&self, jobs: Receiver<Job>, events: Sender<Event>) -> Result<()> {
         let mut compressor = Compressor::new()?;
         while let Ok(mut job) = jobs.recv() {
             // Previews are the live stream, so ones with newer ones waiting
             // behind them aren't worth encoding.
             for newer in jobs.try_iter() {
                 self.outputs.counters.count_preview(job.side, false);
-                pass_on(job)?;
+                events
+                    .send(Event::Encoded(job.side, job.request))
+                    .map_err(|_| anyhow!("capture stopped"))?;
                 job = newer;
             }
             self.encode_preview(&mut compressor, &job)?;
-            pass_on(job)?;
+            events
+                .send(Event::Encoded(job.side, job.request))
+                .map_err(|_| anyhow!("capture stopped"))?;
         }
         bail!("preview job channel closed")
     }
 
-    fn encode_record(&self, compressor: &mut Compressor, job: &Job) -> Result<()> {
+    fn encode_record(&self, compressor: &mut Compressor, job: &Job) -> Result<CameraFrame> {
         let sensor_nanos = *job.request.metadata().get::<SensorTimestamp>()?;
         let timestamp = self.clock.boottime_to_timestamp(sensor_nanos / 1000);
         let buffer = job
@@ -587,13 +601,12 @@ impl Encoder {
             .buffer(&job.streams.record)
             .expect("record buffer attached");
         let quality = self.outputs.record_quality.load(Ordering::Relaxed).into();
-        let jpeg = compress(compressor, buffer, rig::RECORD_SIZE, quality)?;
-        self.outputs.frames.send(Input::Frame(CameraFrame {
+        let jpeg = compress(compressor, buffer, rig::RECORD_SIZE, quality)?.into();
+        Ok(CameraFrame {
             side: job.side,
             timestamp,
             jpeg,
-        }))?;
-        Ok(())
+        })
     }
 
     fn encode_preview(&self, compressor: &mut Compressor, job: &Job) -> Result<()> {
@@ -603,11 +616,17 @@ impl Encoder {
             .expect("preview buffer attached");
         let quality = self.outputs.preview_quality.load(Ordering::Relaxed).into();
         let jpeg = compress(compressor, buffer, job.streams.preview_size, quality)?;
+        let sensor_nanos = *job.request.metadata().get::<SensorTimestamp>()?;
+        let timestamp = self.clock.boottime_to_timestamp(sensor_nanos / 1000);
         // Previews are dropped while the base station isn't keeping up.
         let sent = self
             .outputs
             .previews
-            .try_send(PreviewFrame { side: job.side, jpeg })
+            .try_send(PreviewFrame {
+                side: job.side,
+                timestamp,
+                jpeg: jpeg.into(),
+            })
             .is_ok();
         self.outputs.counters.count_preview(job.side, sent);
         Ok(())

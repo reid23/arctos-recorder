@@ -224,7 +224,7 @@ async fn stitch(
 /// Sends the recording to the cloud server, then follows its progress in the
 /// background so the next recording can be sent meanwhile.
 async fn send_to_cloud(hub: &Arc<Hub>, key: &RecordingKey, recording: Recording) -> Result<()> {
-    let cloud = Cloud::new(&hub.settings.borrow().cloud);
+    let cloud = Cloud::new(&hub.settings.borrow().cloud, hub.network.cloud());
     send_recording(hub, &cloud, key, &recording).await?;
     let (hub, key) = (hub.clone(), key.clone());
     tokio::spawn(async move {
@@ -297,6 +297,7 @@ async fn follow_cloud_job(
             token_sent = None;
             continue;
         };
+        hub.network.note_cloud_arctos(state.arctos);
         match state.status {
             JobStatus::Done => return finish(hub, key, &hub.paths.recording(key), recording),
             JobStatus::Failed(error) => bail!("cloud stitching failed: {error}"),

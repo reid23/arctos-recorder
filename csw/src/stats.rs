@@ -1,11 +1,14 @@
 //! What the camera reports about itself with each poll for instructions:
 //! the Pi's CPU, memory and temperature, how many frames each camera
-//! dropped, and where autofocusing put the lenses.
+//! dropped, where autofocusing put the lenses, and the network link that
+//! reaches the base station.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use protocol::{AutofocusOutcome, CameraStats, FrameCounts, Memory, Side};
+use std::net::Ipv4Addr;
+
+use protocol::{AutofocusOutcome, CameraStats, FrameCounts, Link, Memory, Side};
 use tokio::sync::watch;
 
 const CPU_TIMES_FILE: &str = "/proc/stat";
@@ -69,7 +72,7 @@ impl Reporter {
         }
     }
 
-    pub fn stats(&mut self) -> CameraStats {
+    pub fn stats(&mut self, base_url: &str) -> CameraStats {
         let cpu_times = read_cpu_times();
         let cpu = self
             .cpu_times
@@ -86,8 +89,50 @@ impl Reporter {
                 .and_then(|text| parse_temperature(&text)),
             frames: self.counters.totals(),
             autofocus: *self.autofocus.borrow(),
+            link: read_link(base_url),
         }
     }
+}
+
+/// The link carrying traffic to the base station: its byte counters since
+/// boot and, when the operating system reports one, its speed.
+fn read_link(base_url: &str) -> Option<Link> {
+    let table = std::fs::read_to_string("/proc/net/route").ok()?;
+    let interface = protocol::route_interface(&table, host_address(base_url))
+        .or_else(|| protocol::route_interface(&table, None))?;
+    if interface.contains('/') {
+        return None;
+    }
+    let counter = |name: &str| {
+        std::fs::read_to_string(format!("/sys/class/net/{interface}/statistics/{name}"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    Some(Link {
+        megabits: std::fs::read_to_string(format!("/sys/class/net/{interface}/speed"))
+            .ok()
+            .and_then(|text| link_speed(&text)),
+        sent: counter("tx_bytes")?,
+        received: counter("rx_bytes")?,
+    })
+}
+
+fn host_address(url: &str) -> Option<Ipv4Addr> {
+    url.split("://")
+        .nth(1)?
+        .split([':', '/'])
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Megabits a second from `/sys/class/net/<interface>/speed`. Absent for the
+/// `-1` that means the speed isn't known.
+fn link_speed(text: &str) -> Option<u32> {
+    let speed: i64 = text.trim().parse().ok()?;
+    (speed > 0).then_some(speed as u32)
 }
 
 fn read_cpu_times() -> Option<CpuTimes> {
@@ -243,5 +288,13 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn an_unknown_link_speed_is_left_out() {
+        assert_eq!(link_speed("1000\n"), Some(1000));
+        assert_eq!(link_speed("-1\n"), None);
+        assert_eq!(host_address("http://10.42.0.1:7700"), Some(Ipv4Addr::new(10, 42, 0, 1)));
+        assert_eq!(host_address("http://ar-base.local:7700"), None);
     }
 }

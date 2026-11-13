@@ -8,6 +8,8 @@
 mod auth;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -29,11 +31,37 @@ const DEFAULT_URL: &str = "https://events.californiajugger.org";
 /// Arctos rejects upload chunks larger than 16 MiB.
 const CHUNK_BYTES: usize = 8 << 20;
 
+/// Bytes exchanged with Arctos since this client was created.
+#[derive(Default)]
+pub struct Traffic {
+    sent: AtomicU64,
+    received: AtomicU64,
+}
+
+impl Traffic {
+    pub fn sent(&self) -> u64 {
+        self.sent.load(Ordering::Relaxed)
+    }
+
+    pub fn received(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
+    }
+
+    fn add_sent(&self, bytes: u64) {
+        self.sent.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn add_received(&self, bytes: u64) {
+        self.received.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 pub struct Arctos {
     url: String,
     http: Client,
     headers: HeaderMap,
+    traffic: Arc<Traffic>,
 }
 
 impl Arctos {
@@ -57,7 +85,13 @@ impl Arctos {
             url: url.trim_end_matches('/').to_owned(),
             http,
             headers,
+            traffic: Arc::default(),
         })
+    }
+
+    /// Bytes exchanged with Arctos since this client was created.
+    pub fn traffic(&self) -> &Traffic {
+        &self.traffic
     }
 
     pub fn url(&self) -> &str {
@@ -164,7 +198,7 @@ impl Arctos {
             .query(&[("width", width), ("height", height)])
             .send()
             .await?;
-        let response: Response = json_response(response).await?;
+        let response: Response = self.json_response(response).await?;
         response
             .frames
             .into_iter()
@@ -185,10 +219,14 @@ impl Arctos {
             .get(format!("{}{path_and_query}", self.url))
             .send()
             .await?;
+        let status = response.status();
+        let content_type = response.headers().get(CONTENT_TYPE).cloned();
+        let body = response.bytes().await?;
+        self.traffic.add_received(body.len() as u64);
         Ok(Page {
-            status: response.status(),
-            content_type: response.headers().get(CONTENT_TYPE).cloned(),
-            body: response.bytes().await?,
+            status,
+            content_type,
+            body,
         })
     }
 
@@ -276,7 +314,7 @@ impl Arctos {
         let received = Utc::now();
         let offset = clock_offset(response.headers(), started, received);
         Ok(Timed {
-            value: json_response(response).await?,
+            value: self.json_response(response).await?,
             offset,
         })
     }
@@ -287,7 +325,21 @@ impl Arctos {
         token: &dyn TokenSource,
     ) -> Result<T> {
         let token = token.access_token().await?;
-        json_response(request.bearer_auth(token).send().await?).await
+        let request = request.bearer_auth(token).build()?;
+        if let Some(body) = request.body().and_then(|body| body.as_bytes()) {
+            self.traffic.add_sent(body.len() as u64);
+        }
+        self.json_response(self.http.execute(request).await?).await
+    }
+
+    async fn json_response<T: serde::de::DeserializeOwned>(&self, response: Response) -> Result<T> {
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        self.traffic.add_received(bytes.len() as u64);
+        if !status.is_success() {
+            bail!("Arctos returned {status}: {}", String::from_utf8_lossy(&bytes));
+        }
+        Ok(serde_json::from_slice(&bytes)?)
     }
 }
 
@@ -400,15 +452,6 @@ fn clock_offset(headers: &HeaderMap, started: DateTime<Utc>, received: DateTime<
     let arctos = DateTime::parse_from_rfc2822(value).ok()?.to_utc();
     let midpoint = started.timestamp_micros() + (received.timestamp_micros() - started.timestamp_micros()) / 2;
     Some(arctos.timestamp_micros() - midpoint)
-}
-
-async fn json_response<T: serde::de::DeserializeOwned>(response: Response) -> Result<T> {
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        bail!("Arctos returned {status}: {body}");
-    }
-    Ok(response.json().await?)
 }
 
 #[cfg(test)]

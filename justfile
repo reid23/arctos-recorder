@@ -9,8 +9,8 @@ in-packaging-image := 'docker run --rm --user "$(id -u):$(id -g)" -v "' + justfi
 bsw:
     cargo run --release -p bsw
 
-# Package the base station for Ubuntu 22.04 and later, with its client id on Arctos.
-package-linux client_id:
+# Package the base station for Ubuntu 22.04 and later.
+package-linux client_id: package-csw
     docker build -f deploy/linux/Dockerfile -t arctos-recorder-linux .
     {{in-packaging-image}} -e ARCTOS_CLIENT_ID={{quote(client_id)}} arctos-recorder-linux sh /src/deploy/linux/package.sh
 

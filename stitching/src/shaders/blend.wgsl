@@ -21,9 +21,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let total = weight.x + weight.y;
     var detail = vec3<f32>(0.0);
     if total > MIN_COVERAGE {
-        let left = unpremultiply(textureLoad(left_fine, pixel, 0)) - upsample(left_coarse, pixel, size, true);
-        let right = unpremultiply(textureLoad(right_fine, pixel, 0)) - upsample(right_coarse, pixel, size, true);
+        let left = unpremultiply(textureLoad(left_fine, pixel, 0)) - upsample(left_coarse, pixel, true);
+        let right = unpremultiply(textureLoad(right_fine, pixel, 0)) - upsample(right_coarse, pixel, true);
         detail = (weight.x * left + weight.y * right) / total;
     }
-    textureStore(result, pixel, vec4<f32>(detail + upsample(result_coarse, pixel, size, false), 1.0));
+    textureStore(result, pixel, vec4<f32>(detail + upsample(result_coarse, pixel, false), 1.0));
 }

@@ -2,14 +2,14 @@
 //!
 //! When the [`StitchConfig`] changes, a lookup table is computed for each
 //! camera saying where it saw each output pixel, along with the seam's
-//! weights blurred for each band of the blend. Then for each frame, both
-//! cameras' images are warped through their tables, blurred into Gaussian
-//! levels, blended band by band and collapsed (see
-//! [`Blend`](crate::geometry::Blend)). A level is stored at half the size of
-//! the one before once it is blurred enough not to lose anything by it. The
-//! levels hold premultiplied colors normalized at every level, so the area
-//! past each camera's image is filled in from the image around it instead
-//! of blending in black.
+//! weights blurred for each level of the blend. Then for each frame, both
+//! cameras' images are warped through their tables, reduced into Burt and
+//! Adelson's pyramid (each level half the size of the one before), blended
+//! level by level and collapsed. Each level's detail is blended with the
+//! weights of the band of the [`Blend`](crate::geometry::Blend) it falls in,
+//! so a band can span several levels. The levels hold premultiplied colors
+//! normalized at every level, so the area past each camera's image is filled
+//! in from the image around it instead of blending in black.
 //!
 //! Colors stay in the YCbCr of the cameras' JPEGs until the result is packed
 //! on the GPU into a planar YUV 4:2:0 frame, ready to be compressed or
@@ -31,9 +31,6 @@ use crate::overlay::RgbaImage;
 
 /// Width in input pixels over which a camera's image fades out at its edge.
 const EDGE_FADE: f32 = 2.0;
-/// The blur, in a blend level's own pixels, that lets it be half the size of
-/// the level before.
-const LEVEL_SIGMA: f64 = 1.0;
 const ACROSS: [i32; 2] = [1, 0];
 const DOWN: [i32; 2] = [0, 1];
 const WORKGROUP_SIZE: u32 = 8;
@@ -207,6 +204,8 @@ struct Pipelines {
     warp: wgpu::ComputePipeline,
     seam: wgpu::ComputePipeline,
     blur: wgpu::ComputePipeline,
+    reduce_across: wgpu::ComputePipeline,
+    reduce_down: wgpu::ComputePipeline,
     restrict: wgpu::ComputePipeline,
     blend_top: wgpu::ComputePipeline,
     blend: wgpu::ComputePipeline,
@@ -233,11 +232,14 @@ impl Pipelines {
         };
         let with_pyramid = |source: &str| format!("{PYRAMID}\n{source}");
         let pack = include_str!("shaders/pack.wgsl");
+        let reduce = include_str!("shaders/reduce.wgsl");
         Pipelines {
             lut: pipeline("lut", include_str!("shaders/lut.wgsl").into(), "main"),
             warp: pipeline("warp", include_str!("shaders/warp.wgsl").into(), "main"),
             seam: pipeline("seam", include_str!("shaders/seam.wgsl").into(), "main"),
             blur: pipeline("blur", include_str!("shaders/blur.wgsl").into(), "main"),
+            reduce_across: pipeline("reduce_across", reduce.into(), "across"),
+            reduce_down: pipeline("reduce_down", reduce.into(), "down"),
             restrict: pipeline(
                 "restrict",
                 include_str!("shaders/restrict.wgsl").into(),
@@ -401,24 +403,53 @@ struct Level {
     scale: u32,
 }
 
+/// How blurred, in output pixels, the pyramid's image is at `level`, each
+/// REDUCE blurring by one pixel of the level it reduces.
+fn pyramid_sigma(level: usize) -> f64 {
+    ((4f64.powi(level as i32) - 1.0) / 3.0).sqrt()
+}
+
+/// The band of a blend with `sigmas` that the detail at `level` falls in,
+/// judged by the next level's blur over \(\sqrt{2}\), about the geometric
+/// middle of the blurs the detail lies between.
+fn band_at(level: usize, sigmas: &[f64]) -> usize {
+    let middle = pyramid_sigma(level + 1) / std::f64::consts::SQRT_2;
+    sigmas[1..].iter().filter(|&&sigma| sigma <= middle).count()
+}
+
 /// The blend's levels for an output `size` big whose bands are blurred by
-/// `sigmas` output pixels, finest first. Each level is half the size of the
-/// one before if it's blurred by at least [`LEVEL_SIGMA`] of the smaller
-/// pixels.
+/// `sigmas` output pixels, finest first: each half the size of the one
+/// before, down to the first whose detail falls in the last band or that
+/// can't be halved.
 fn level_layout(size: (u32, u32), sigmas: &[f64]) -> Vec<Level> {
     let mut level = Level { size, scale: 1 };
     let mut layout = vec![level];
-    for &sigma in sigmas.iter().skip(1) {
+    while band_at(layout.len() - 1, sigmas) + 1 < sigmas.len() && level.size.0.min(level.size.1) >= 2 {
         let (width, height) = level.size;
-        if width.min(height) >= 2 && sigma / (2 * level.scale) as f64 >= LEVEL_SIGMA {
-            level = Level {
-                size: (width.div_ceil(2), height.div_ceil(2)),
-                scale: level.scale * 2,
-            };
-        }
+        level = Level {
+            size: (width.div_ceil(2), height.div_ceil(2)),
+            scale: level.scale * 2,
+        };
         layout.push(level);
     }
     layout
+}
+
+/// How blurred, in output pixels, the seam's weights are at each of
+/// `levels` levels of a blend with `sigmas`: as the band the level's detail
+/// falls in (the last band for the coarsest level, which holds everything
+/// coarser), and at least as the level's image so they don't alias.
+fn weight_sigmas(levels: usize, sigmas: &[f64]) -> Vec<f64> {
+    (0..levels)
+        .map(|level| {
+            let band = if level + 1 == levels {
+                sigmas.len() - 1
+            } else {
+                band_at(level, sigmas)
+            };
+            sigmas[band].max(pyramid_sigma(level))
+        })
+        .collect()
 }
 
 /// The blend's finest level, which is the output's size whatever the blend.
@@ -432,10 +463,9 @@ struct FinestLevel {
 /// The blend's levels for a [`level_layout`], and the passes between them.
 struct Levels {
     layout: Vec<Level>,
-    /// By level, blurring it into the next across and then down.
-    image_blur_uniforms: Vec<[wgpu::Buffer; 2]>,
+    /// By level, reducing or blurring it into the next across and then down.
+    image_reduce_bind_groups: [Vec<[wgpu::BindGroup; 2]>; 2],
     weight_blur_uniforms: Vec<[wgpu::Buffer; 2]>,
-    image_blur_bind_groups: [Vec<[wgpu::BindGroup; 2]>; 2],
     weight_blur_bind_groups: Vec<[wgpu::BindGroup; 2]>,
     blend_top_bind_group: wgpu::BindGroup,
     /// By level but the coarsest.
@@ -450,22 +480,18 @@ impl Levels {
         layout: Vec<Level>,
     ) -> Levels {
         let steps = layout.len() - 1;
-        let blur_uniforms = || -> Vec<[wgpu::Buffer; 2]> {
-            (0..steps)
-                .map(|_| {
-                    [(); 2].map(|()| {
-                        device.create_buffer(&wgpu::BufferDescriptor {
-                            label: Some("blur"),
-                            size: size_of::<BlurUniform>() as u64,
-                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                            mapped_at_creation: false,
-                        })
+        let weight_blur_uniforms: Vec<[wgpu::Buffer; 2]> = (0..steps)
+            .map(|_| {
+                [(); 2].map(|()| {
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("blur"),
+                        size: size_of::<BlurUniform>() as u64,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
                     })
                 })
-                .collect()
-        };
-        let image_blur_uniforms = blur_uniforms();
-        let weight_blur_uniforms = blur_uniforms();
+            })
+            .collect();
 
         let coarser_levels = || -> Vec<Image> {
             layout[1..]
@@ -483,39 +509,55 @@ impl Levels {
         let weights = all_levels(&finest.weights, &coarser_weights);
         let results = all_levels(&finest.result, &coarser_results);
 
-        let blur_bind_groups = |levels: &[&Image], uniforms: &[[wgpu::Buffer; 2]]| {
+        let across_image = |level: usize| {
+            Image::intermediate(device, (layout[level + 1].size.0, layout[level].size.1))
+        };
+        let image_reduce_bind_groups = [0, 1].map(|side| {
+            let levels = &images[side];
             (0..steps)
                 .map(|level| {
-                    let across = Image::intermediate(
-                        device,
-                        (layout[level + 1].size.0, layout[level].size.1),
-                    );
+                    let across = across_image(level);
                     [
                         bind_group(
                             device,
-                            &pipelines.blur,
-                            &[
-                                uniforms[level][0].as_entire_binding(),
-                                view(levels[level]),
-                                view(&across),
-                            ],
+                            &pipelines.reduce_across,
+                            &[view(levels[level]), view(&across)],
                         ),
                         bind_group(
                             device,
-                            &pipelines.blur,
-                            &[
-                                uniforms[level][1].as_entire_binding(),
-                                view(&across),
-                                view(levels[level + 1]),
-                            ],
+                            &pipelines.reduce_down,
+                            &[view(&across), view(levels[level + 1])],
                         ),
                     ]
                 })
                 .collect()
-        };
-        let image_blur_bind_groups =
-            [0, 1].map(|side| blur_bind_groups(&images[side], &image_blur_uniforms));
-        let weight_blur_bind_groups = blur_bind_groups(&weights, &weight_blur_uniforms);
+        });
+        let weight_blur_bind_groups = (0..steps)
+            .map(|level| {
+                let across = across_image(level);
+                let uniforms = &weight_blur_uniforms[level];
+                [
+                    bind_group(
+                        device,
+                        &pipelines.blur,
+                        &[
+                            uniforms[0].as_entire_binding(),
+                            view(weights[level]),
+                            view(&across),
+                        ],
+                    ),
+                    bind_group(
+                        device,
+                        &pipelines.blur,
+                        &[
+                            uniforms[1].as_entire_binding(),
+                            view(&across),
+                            view(weights[level + 1]),
+                        ],
+                    ),
+                ]
+            })
+            .collect();
 
         let blend_top_bind_group = bind_group(
             device,
@@ -546,27 +588,27 @@ impl Levels {
             .collect();
         Levels {
             layout,
-            image_blur_uniforms,
+            image_reduce_bind_groups,
             weight_blur_uniforms,
-            image_blur_bind_groups,
             weight_blur_bind_groups,
             blend_top_bind_group,
             blend_bind_groups,
         }
     }
 
-    /// Blurs the finest level of the images or weights `bind_groups` are
-    /// for into each coarser one in turn.
-    fn dispatch_blurs(
+    /// Reduces or blurs the finest level of the images or weights
+    /// `bind_groups` are for into each coarser one in turn, across and then
+    /// down with `pipelines`.
+    fn dispatch_down_the_levels(
         &self,
         pass: &mut wgpu::ComputePass,
-        pipelines: &Pipelines,
+        pipelines: [&wgpu::ComputePipeline; 2],
         bind_groups: &[[wgpu::BindGroup; 2]],
     ) {
         for (pair, [across, down]) in self.layout.windows(2).zip(bind_groups) {
             let (fine, coarse) = (pair[0], pair[1]);
-            dispatch(pass, &pipelines.blur, across, (coarse.size.0, fine.size.1));
-            dispatch(pass, &pipelines.blur, down, coarse.size);
+            dispatch(pass, pipelines[0], across, (coarse.size.0, fine.size.1));
+            dispatch(pass, pipelines[1], down, coarse.size);
         }
     }
 }
@@ -816,6 +858,7 @@ impl Stitcher {
         let (width, height) = self.output_size;
         let sigmas = config.blend.sigmas_for(height);
         let layout = level_layout(self.output_size, &sigmas);
+        let weight_sigmas = weight_sigmas(layout.len(), &sigmas);
         if self.levels.layout != layout {
             self.levels = Levels::new(&self.gpu.device, &self.pipelines, &self.finest, layout);
         }
@@ -826,26 +869,18 @@ impl Stitcher {
         };
         write_blur(
             &self.blur_uniforms[0],
-            BlurUniform::new(ACROSS, sigmas[0], 1, width),
+            BlurUniform::new(ACROSS, weight_sigmas[0], 1, width),
         );
         write_blur(
             &self.blur_uniforms[1],
-            BlurUniform::new(DOWN, sigmas[0], 1, height),
+            BlurUniform::new(DOWN, weight_sigmas[0], 1, height),
         );
-        for (level, pair) in self.levels.layout.windows(2).enumerate() {
-            let (fine, coarse) = (pair[0], pair[1]);
-            let step = coarse.scale / fine.scale;
-            let blurring_from = |sigma: f64| {
-                (sigmas[level + 1].powi(2) - sigma.powi(2)).max(0.0).sqrt() / fine.scale as f64
-            };
-            let image_sigma = if level == 0 { 0.0 } else { sigmas[level] };
-            for (uniforms, sigma) in [
-                (&self.levels.image_blur_uniforms[level], blurring_from(image_sigma)),
-                (&self.levels.weight_blur_uniforms[level], blurring_from(sigmas[level])),
-            ] {
-                write_blur(&uniforms[0], BlurUniform::new(ACROSS, sigma, step, fine.size.0));
-                write_blur(&uniforms[1], BlurUniform::new(DOWN, sigma, step, fine.size.1));
-            }
+        for (level, fine) in self.levels.layout[..self.levels.layout.len() - 1].iter().enumerate() {
+            let sigma = (weight_sigmas[level + 1].powi(2) - weight_sigmas[level].powi(2)).sqrt()
+                / fine.scale as f64;
+            let uniforms = &self.levels.weight_blur_uniforms[level];
+            write_blur(&uniforms[0], BlurUniform::new(ACROSS, sigma, 2, fine.size.0));
+            write_blur(&uniforms[1], BlurUniform::new(DOWN, sigma, 2, fine.size.1));
         }
 
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
@@ -870,8 +905,11 @@ impl Stitcher {
                 &self.restrict_bind_group,
                 self.output_size,
             );
-            self.levels
-                .dispatch_blurs(&mut pass, pipelines, &self.levels.weight_blur_bind_groups);
+            self.levels.dispatch_down_the_levels(
+                &mut pass,
+                [&pipelines.blur; 2],
+                &self.levels.weight_blur_bind_groups,
+            );
         }
         self.gpu.queue.submit([encoder.finish()]);
         Ok(())
@@ -966,8 +1004,12 @@ impl Stitcher {
                 dispatch(&mut pass, &pipelines.warp, bind_group, self.output_size);
             }
             let levels = &self.levels;
-            for bind_groups in &levels.image_blur_bind_groups {
-                levels.dispatch_blurs(&mut pass, pipelines, bind_groups);
+            for bind_groups in &levels.image_reduce_bind_groups {
+                levels.dispatch_down_the_levels(
+                    &mut pass,
+                    [&pipelines.reduce_across, &pipelines.reduce_down],
+                    bind_groups,
+                );
             }
             let top = levels.layout.len() - 1;
             dispatch(
@@ -1162,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn levels_halve_once_blurred_enough() {
+    fn levels_halve_until_the_last_band() {
         let level = |width, height, scale| Level {
             size: (width, height),
             scale,
@@ -1171,16 +1213,24 @@ mod tests {
             level_layout((480, 241), &[0.5, 1.5, 3.0, 3.5, 9.0]),
             [
                 level(480, 241, 1),
-                level(480, 241, 1),
-                level(240, 121, 2),
                 level(240, 121, 2),
                 level(120, 61, 4),
+                level(60, 31, 8),
+                level(30, 16, 16),
             ]
         );
-        assert_eq!(
-            level_layout((2, 1), &[1.0, 4.0]),
-            [level(2, 1, 1), level(2, 1, 1)]
-        );
+        assert_eq!(level_layout((480, 240), &[0.0; 4]), [level(480, 240, 1)]);
+        assert_eq!(level_layout((2, 1), &[1.0, 4.0]), [level(2, 1, 1)]);
+    }
+
+    #[test]
+    fn weights_blur_as_their_band_without_aliasing() {
+        let sigmas = [0.5, 1.5, 3.0, 3.5, 9.0];
+        let expected = [0.5, 1.5, 3.0, 21f64.sqrt(), 85f64.sqrt()];
+        let actual = weight_sigmas(expected.len(), &sigmas);
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-9, "{actual} isn't {expected}");
+        }
     }
 
     #[test]

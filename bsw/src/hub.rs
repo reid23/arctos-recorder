@@ -14,8 +14,8 @@ use arctos::{Arctos, timestamp};
 use bytes::Bytes;
 use chrono::Utc;
 use protocol::{
-    AudioDevice, AutofocusOutcome, CameraStats, Directive, Focus, Instructions, MatchManifest,
-    Timestamp,
+    AudioDevice, AutofocusOutcome, CameraStats, DEFAULT_PREVIEW_QUALITY, Directive, Focus,
+    Instructions, MatchManifest, Timestamp, rig,
 };
 use stitching::JobStatus;
 use stitching::browser::Chromium;
@@ -54,6 +54,9 @@ pub struct Hub {
     /// stitching in the cloud.
     pub calibrating: watch::Sender<BTreeSet<String>>,
     pub performance: watch::Sender<Performance>,
+    pub network: Arc<crate::network::Network>,
+    pub network_usage: watch::Sender<crate::network::Usage>,
+    pub expected_camera_software_id: Option<String>,
     /// Only kept on Linux.
     pub camera_port: watch::Sender<CameraPort>,
     links: Mutex<HashMap<String, Arc<CameraLink>>>,
@@ -83,12 +86,14 @@ impl Transfer {
 
 pub struct Paths {
     root: PathBuf,
+    recordings: PathBuf,
 }
 
 impl Paths {
-    pub fn new(root: PathBuf) -> Result<Self> {
-        std::fs::create_dir_all(root.join("recordings"))?;
-        Ok(Paths { root })
+    pub fn new(root: PathBuf, recordings: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&root).context("creating the data directory")?;
+        std::fs::create_dir_all(&recordings).context("creating the recordings folder")?;
+        Ok(Paths { root, recordings })
     }
 
     pub fn settings(&self) -> PathBuf {
@@ -100,7 +105,7 @@ impl Paths {
     }
 
     pub fn recordings(&self) -> PathBuf {
-        self.root.join("recordings")
+        self.recordings.clone()
     }
 
     /// Where Chromium is downloaded to when no browser is installed.
@@ -122,6 +127,7 @@ impl Paths {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CameraStatus {
     pub address: IpAddr,
+    pub software_id: Option<String>,
     /// Whether it has polled for its instructions recently.
     pub online: bool,
     /// Whether its microphone's audio is arriving.
@@ -149,12 +155,19 @@ pub struct CameraLink {
     pub reported_calibration: watch::Sender<Calibration>,
     /// Latest preview of each camera, indexed by [`protocol::Side::index`].
     pub previews: [watch::Sender<Option<Bytes>>; 2],
+    /// Timestamped stereo previews for live stitching.
+    pub live: broadcast::Sender<StereoPreview>,
     /// Latest stitched preview JPEG.
     pub panorama: watch::Sender<Option<Bytes>>,
     /// The microphone's audio as it arrives, as in [`protocol::AUDIO_FILE`].
     pub audio: broadcast::Sender<Bytes>,
     pub last_audio: Mutex<Option<Instant>>,
     pub autofocus: watch::Sender<AutofocusState>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StereoPreview {
+    pub jpegs: [Bytes; 2],
 }
 
 /// Where autofocusing a camera's lenses is up to.
@@ -209,6 +222,12 @@ impl Hub {
         settings: Settings,
         job_queue: mpsc::UnboundedSender<Order>,
     ) -> Self {
+        let expected_camera_software_id = std::env::current_exe()
+            .ok()
+            .and_then(|executable| {
+                std::fs::read_to_string(executable.parent()?.join("camera-software-id")).ok()
+            })
+            .map(|software_id| software_id.trim().to_owned());
         Hub {
             chromium: Chromium::installed_or_downloaded_into(paths.chromium()),
             paths,
@@ -221,6 +240,9 @@ impl Hub {
             jobs: watch::Sender::default(),
             calibrating: watch::Sender::default(),
             performance: watch::Sender::default(),
+            network: Arc::default(),
+            network_usage: watch::Sender::new(crate::network::Usage::measuring()),
+            expected_camera_software_id,
             camera_port: watch::Sender::default(),
             links: Mutex::default(),
             last_seen: Mutex::default(),
@@ -250,6 +272,7 @@ impl Hub {
         self: &Arc<Self>,
         camera: &str,
         address: IpAddr,
+        software_id: Option<String>,
         calibration: Calibration,
         setup: Option<RigSetup>,
         audio_devices: Vec<AudioDevice>,
@@ -272,6 +295,10 @@ impl Hub {
                     stitch: watch::Sender::new(Arc::new(stitch)),
                     reported_calibration: watch::Sender::new(calibration),
                     previews: Default::default(),
+                    live: broadcast::channel(
+                        (protocol::rig::FPS / protocol::rig::RECORD_PREVIEW_DECIMATION / 2) as usize,
+                    )
+                    .0,
                     panorama: watch::Sender::new(None),
                     audio: broadcast::channel(AUDIO_BACKLOG).0,
                     last_audio: Mutex::new(None),
@@ -298,6 +325,7 @@ impl Hub {
                 camera.to_owned(),
                 CameraStatus {
                     address,
+                    software_id,
                     online: true,
                     hearing_audio,
                     audio_devices,
@@ -363,6 +391,9 @@ impl Hub {
             return Ok(None);
         };
         self.last_seen.lock().unwrap().insert(camera.to_owned(), now);
+        if let Some(link) = stats.link {
+            self.network.note_link(camera, link);
+        }
         if let Some(outcome) = stats.autofocus {
             let mut focused = None;
             link.autofocus.send_if_modified(|state| {
@@ -408,8 +439,8 @@ impl Hub {
             confirmed_at: field_status.map_or(Timestamp(0), |status| status.confirmed_at),
             audio_device: settings.audio_device(camera).to_owned(),
             record_quality: settings.recording.camera_quality,
-            preview_size: settings.live.camera_size,
-            preview_quality: settings.live.camera_quality,
+            preview_size: rig::DEFAULT_PREVIEW_SIZE,
+            preview_quality: settings.live.camera_quality.min(DEFAULT_PREVIEW_QUALITY),
             focus,
             margins: settings.recording.margins,
             buffer: settings.recording.buffer,
@@ -582,7 +613,7 @@ mod tests {
     async fn the_setup_a_camera_keeps_replaces_this_computers_copy() {
         let root = std::env::temp_dir().join(format!("bsw-hub-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let paths = Paths::new(root).unwrap();
+        let paths = Paths::new(root.clone(), root.join("recordings")).unwrap();
         let arctos = Arctos::from_env().unwrap();
         let account = Account::load(arctos.clone(), paths.account()).unwrap();
         let ours = RigSetup {
@@ -601,6 +632,7 @@ mod tests {
             temperature: None,
             frames: Default::default(),
             autofocus: None,
+            link: None,
         };
         let given = || {
             let instructions = hub.instructions("ar-1", &stats).unwrap().unwrap();

@@ -2,14 +2,17 @@
 
 use std::net::Ipv4Addr;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use arctos::Arctos;
 use axum::extract::ws::{Message, WebSocket};
+use futures_util::{SinkExt, StreamExt};
 use bytes::Bytes;
 use stitching::browser::Chromium;
-use stitching::cloud::LiveConfig;
+use stitching::cloud::{CloudTraffic, LiveConfig, LiveUpdate, Transfer};
 use stitching::geometry::StitchConfig;
 use stitching::live::{LiveStitcher, StereoYuv};
 use stitching::overlay::{self, PlacedImage};
@@ -75,8 +78,7 @@ pub async fn run(mut socket: WebSocket, arctos: &Arctos) -> Result<()> {
 
     let (panoramas, panoramas_rx) = watch::channel(None);
     let chromium = Chromium::installed();
-    // Never changes during the connection.
-    let (_overlay_config, overlay_config) = watch::channel(overlay.map(|overlay| (overlay, size)));
+    let (overlay_updates, overlay_config) = watch::channel(overlay.map(|overlay| (overlay, size)));
     let (overlay_images, overlay_images_rx) = watch::channel(None);
     let runtime = Handle::current();
     let stitcher = tokio::task::spawn_blocking(move || {
@@ -90,26 +92,64 @@ pub async fn run(mut socket: WebSocket, arctos: &Arctos) -> Result<()> {
             &panoramas,
         )
     });
+    let restream_sent = Arc::new(AtomicU64::new(0));
+    let (mut sink, mut incoming) = socket.split();
     let forward = async {
-        while let Some(message) = socket.recv().await {
+        while let Some(message) = incoming.next().await {
             match message? {
                 Message::Binary(chunk) => {
                     stream.write_all(&chunk).await?;
                     let _ = stream_copy.try_send(chunk);
                 }
-                Message::Text(config) => {
-                    stitch.send_replace(serde_json::from_str(&config)?);
-                }
+                Message::Text(update) => match serde_json::from_str(&update)? {
+                    LiveUpdate::Stitch(config) => {
+                        stitch.send_replace(config);
+                    }
+                    LiveUpdate::Overlay { overlay } => {
+                        overlay_updates.send_replace(overlay.map(|overlay| (overlay, size)));
+                    }
+                },
                 Message::Close(_) => break,
                 _ => {}
             }
         }
         anyhow::Ok(())
     };
+    let report_sent = restream_sent.clone();
+    let report = async {
+        let mut reports = tokio::time::interval(Duration::from_secs(1));
+        reports.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        reports.tick().await;
+        loop {
+            reports.tick().await;
+            let traffic = arctos.traffic();
+            let report = CloudTraffic {
+                restream_sent: report_sent.load(Ordering::Relaxed),
+                arctos: Transfer {
+                    sent: traffic.sent(),
+                    received: traffic.received(),
+                },
+            };
+            if sink
+                .send(Message::Text(serde_json::to_string(&report)?.into()))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+    };
     tokio::select! {
         result = forward => result,
+        result = report => result,
         result = stitcher => result?,
-        result = restream::stream(&destination, bitrate, panoramas_rx, restream::Audio::MpegTs(&audio_url)) => result,
+        result = restream::stream(
+            &destination,
+            bitrate,
+            panoramas_rx,
+            restream::Audio::MpegTs(&audio_url),
+            restream_sent,
+        ) => result,
         result = feed_audio => result,
         () = overlay::follow_live(arctos, &chromium, overlay_config, &overlay_images) => {
             unreachable!("the overlay config is still open")

@@ -1,6 +1,7 @@
 //! Streams preview frames and microphone audio to the base station over a
 //! WebSocket.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -12,7 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::base::BaseStation;
 
 pub struct Inputs {
-    pub frames: Receiver<PreviewFrame<Vec<u8>>>,
+    pub frames: Receiver<PreviewFrame<Arc<[u8]>>>,
     /// Little-endian PCM.
     pub audio: Receiver<Vec<u8>>,
 }
@@ -41,10 +42,10 @@ async fn stream(base: &BaseStation, inputs: &mut Inputs) -> Result<()> {
     tracing::info!("streaming previews");
     loop {
         let message = tokio::select! {
-            Some(frame) = inputs.frames.recv() => PreviewMessage::Frame(frame),
-            Some(pcm) = inputs.audio.recv() => PreviewMessage::Audio(pcm),
+            Some(frame) = inputs.frames.recv() => PreviewMessage::Frame(frame).encode(),
+            Some(pcm) = inputs.audio.recv() => PreviewMessage::Audio(pcm).encode(),
             else => return Ok(()),
         };
-        socket.send(Message::binary(message.encode())).await?;
+        socket.send(Message::binary(message)).await?;
     }
 }

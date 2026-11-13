@@ -19,8 +19,7 @@
 //! - `GET {live}` is a WebSocket for forwarding a camera's live previews to
 //!   be stitched and restreamed. The first message is a text [`LiveConfig`];
 //!   the rest are binary chunks of an MPEG-TS stream of H.264-encoded
-//!   [`StereoYuv`](crate::live::StereoYuv) frames, or text
-//!   [`StitchConfig`]s changing how they are stitched.
+//!   [`StereoYuv`](crate::live::StereoYuv) frames, or text [`LiveUpdate`]s.
 
 use protocol::Segment;
 use serde::{Deserialize, Serialize};
@@ -70,12 +69,31 @@ pub struct FileChunk {
     pub size: u64,
 }
 
+/// Bytes sent and received on one connection, as running totals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transfer {
+    pub sent: u64,
+    pub received: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobState {
     pub status: JobStatus,
     /// Files of the recording the server doesn't have yet.
     pub missing: Vec<(Segment, String)>,
     pub has_token: bool,
+    /// Bytes this server has exchanged with Arctos since it started.
+    #[serde(default)]
+    pub arctos: Transfer,
+}
+
+/// What the cloud server tells the base station, once a second, on the live
+/// WebSocket: bytes sent to the restream destination since the restream
+/// started, and bytes exchanged with Arctos since the server started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudTraffic {
+    pub restream_sent: u64,
+    pub arctos: Transfer,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,4 +108,39 @@ pub struct LiveConfig {
     /// Of the restream's video, in megabits a second.
     pub bitrate: f64,
     pub overlay: Option<LiveOverlay>,
+}
+
+/// A text message on the live WebSocket after [`LiveConfig`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LiveUpdate {
+    /// How to stitch the frames from now on.
+    Stitch(StitchConfig),
+    /// The scoreboard to draw from now on, or none to stop drawing it.
+    Overlay { overlay: Option<LiveOverlay> },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::{Calibration, Orientation, StitchConfig};
+
+    #[test]
+    fn live_updates_keep_stitch_configs_distinct_from_the_overlay() {
+        let stitch = LiveUpdate::Stitch(StitchConfig::fitting(Calibration::nominal([
+            Orientation::default(),
+            Orientation::default(),
+        ])));
+        let stitch = serde_json::to_string(&stitch).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<LiveUpdate>(&stitch).unwrap(),
+            LiveUpdate::Stitch(_)
+        ));
+
+        let hidden = serde_json::to_string(&LiveUpdate::Overlay { overlay: None }).unwrap();
+        assert_eq!(
+            serde_json::from_str::<LiveUpdate>(&hidden).unwrap(),
+            LiveUpdate::Overlay { overlay: None }
+        );
+    }
 }

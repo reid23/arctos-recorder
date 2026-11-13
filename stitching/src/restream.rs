@@ -3,6 +3,8 @@
 
 use std::collections::VecDeque;
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
@@ -108,19 +110,30 @@ pub async fn stream(
     bitrate: f64,
     mut frames: watch::Receiver<Option<Bytes>>,
     audio: Audio<'_>,
+    sent: Arc<AtomicU64>,
 ) -> Result<()> {
     let fps = live::FPS.to_string();
     let encoding = LiveEncoding::find().await?;
     let mut ffmpeg = Command::new(ffmpeg_program())
         .args(["-loglevel", "error"])
         .args(encoding.input_args)
-        .args(["-use_wallclock_as_timestamps", "1", "-f", "mjpeg", "-i", "-"])
+        .args([
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-f",
+            "mjpeg",
+            "-framerate",
+            "1000",
+            "-i",
+            "-",
+        ])
         .args(audio.input_args())
         .args(["-map", "0:v"])
         .args(encoding.output_args)
-        .args(["-r", &fps, "-g", &fps])
+        .args(["-r", &fps, "-fps_mode", "cfr", "-g", &fps])
         .args(bitrate_args(bitrate))
         .args(AUDIO_OUTPUT_ARGS)
+        .args(["-progress", "pipe:2", "-nostats"])
         .args(["-f", "flv"])
         .arg(destination.url())
         .stdin(Stdio::piped())
@@ -129,7 +142,11 @@ pub async fn stream(
         .spawn()
         .context("starting ffmpeg")?;
     let mut stdin = ffmpeg.stdin.take().expect("piped stdin");
-    let errors = tokio::spawn(last_lines(ffmpeg.stderr.take().expect("piped stderr")));
+    sent.store(0, Ordering::Relaxed);
+    let errors = tokio::spawn(last_lines(
+        ffmpeg.stderr.take().expect("piped stderr"),
+        sent,
+    ));
     tracing::info!("restreaming to {}", destination.server);
     let mut size = None;
     loop {
@@ -169,17 +186,43 @@ async fn failure(
     }
 }
 
-/// The last [`ERROR_LINES`] lines ffmpeg wrote to `stderr` before closing it.
-async fn last_lines(stderr: ChildStderr) -> VecDeque<String> {
+/// The last [`ERROR_LINES`] lines ffmpeg wrote to `stderr` before closing
+/// it. Progress lines (`-progress pipe:2`) are not errors; `total_size` is
+/// stored in `sent`.
+async fn last_lines(stderr: ChildStderr, sent: Arc<AtomicU64>) -> VecDeque<String> {
     let mut lines = BufReader::new(stderr).lines();
     let mut last = VecDeque::with_capacity(ERROR_LINES);
     while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(bytes) = total_size(&line) {
+            sent.store(bytes, Ordering::Relaxed);
+        }
+        if is_progress(&line) {
+            continue;
+        }
         if last.len() == ERROR_LINES {
             last.pop_front();
         }
         last.push_back(line);
     }
     last
+}
+
+/// Bytes ffmpeg has written to the restream, from a `-progress` line.
+fn total_size(line: &str) -> Option<u64> {
+    let value = line.strip_prefix("total_size=")?;
+    let bytes: i64 = value.parse().ok()?;
+    (bytes >= 0).then_some(bytes as u64)
+}
+
+/// Whether `line` is one field of ffmpeg's `-progress` output.
+fn is_progress(line: &str) -> bool {
+    let Some((key, _)) = line.split_once('=') else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 #[cfg(test)]
@@ -208,5 +251,14 @@ mod tests {
         };
         assert_eq!(keyless.url(), "rtmp://example.org/live/stream");
         assert_eq!(keyless.redact("Connection refused"), "Connection refused");
+    }
+
+    #[test]
+    fn progress_counts_bytes_written_and_is_not_an_error() {
+        assert_eq!(total_size("total_size=2048"), Some(2048));
+        assert_eq!(total_size("total_size=-1"), None);
+        assert!(is_progress("total_size=2048"));
+        assert!(is_progress("progress=continue"));
+        assert!(!is_progress("Error opening output: Input/output error"));
     }
 }

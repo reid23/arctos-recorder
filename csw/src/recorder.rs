@@ -15,13 +15,11 @@ use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use protocol::{
-    AUDIO_FILE, DEFAULT_MARGINS, Directive, Margins, MatchManifest, Segment, Side, Span, Timestamp, rig,
-};
+use crossbeam_channel::Receiver;
+use protocol::{AUDIO_FILE, Directive, Margins, MatchManifest, Segment, Side, Span, Timestamp, rig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, watch};
 
@@ -33,6 +31,9 @@ pub const CLOSED_FILE: &str = "closed.json";
 /// Frames kept past the memory buffer, outside any match directory so a
 /// finished match can be deleted while a later one still needs them.
 const HOLD_DIR: &str = ".hold";
+/// Prevents a base-station setting from exhausting a 1 GB camera.
+const MAX_MEMORY_BUFFER: Duration = Duration::from_secs(6);
+const REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 pub enum Input {
     Frame(CameraFrame),
@@ -44,7 +45,7 @@ pub enum Input {
 pub struct CameraFrame {
     pub side: Side,
     pub timestamp: Timestamp,
-    pub jpeg: Vec<u8>,
+    pub jpeg: Arc<[u8]>,
 }
 
 pub struct AudioChunk {
@@ -93,6 +94,7 @@ struct State {
     confirmed_at: Timestamp,
     /// Matches already finished. A later record of one of them is ignored.
     finished: BTreeSet<String>,
+    max_write_micros: u128,
 }
 
 enum Held {
@@ -123,19 +125,13 @@ fn fate(timestamp: Timestamp, play: &[Span], margins: Margins, confirmed_at: Tim
         return Fate::Wait;
     }
     let mut covered = false;
-    let mut open = false;
     for span in play {
         if span.covers(timestamp, margins) {
             covered = true;
-            if span.end.is_none() {
-                open = true;
-            }
         }
     }
     if !covered {
         Fate::Drop
-    } else if open {
-        Fate::Wait
     } else {
         Fate::Keep
     }
@@ -154,11 +150,13 @@ impl State {
             session: None,
             confirmed_at: Timestamp(0),
             finished: BTreeSet::new(),
+            max_write_micros: 0,
         }
     }
 
     fn run(mut self, inputs: Receiver<Input>) -> Result<()> {
-        for input in inputs {
+        let mut last_report = Instant::now();
+        while let Ok(input) = inputs.recv() {
             match input {
                 Input::Guide { directive, confirmed_at } => self.on_guide(directive, confirmed_at)?,
                 Input::Frame(frame) if self.session.is_some() => {
@@ -170,6 +168,39 @@ impl State {
                 Input::Audio(chunk) if self.session.is_some() => self.audio.push_back(chunk),
                 // Stragglers from before the match started or after it ended.
                 Input::Frame(_) | Input::Audio(_) => {}
+            }
+            if last_report.elapsed() >= REPORT_INTERVAL {
+                let memory_bytes: usize = self
+                    .frames
+                    .iter()
+                    .filter_map(|held| match held {
+                        Held::Memory(frame) => Some(frame.jpegs.iter().map(|jpeg| jpeg.len()).sum::<usize>()),
+                        Held::Disk(_) => None,
+                    })
+                    .sum();
+                let disk_frames = self
+                    .frames
+                    .iter()
+                    .filter(|held| matches!(held, Held::Disk(_)))
+                    .count();
+                let held_span_millis = self
+                    .frames
+                    .front()
+                    .zip(self.frames.back())
+                    .map_or(0, |(oldest, newest)| {
+                        newest.timestamp().micros_since(oldest.timestamp()).max(0) / 1_000
+                    });
+                tracing::info!(
+                    queued_inputs = inputs.len(),
+                    input_capacity = inputs.capacity().unwrap_or(0),
+                    held_memory_bytes = memory_bytes,
+                    disk_frames,
+                    held_span_millis,
+                    max_write_micros = self.max_write_micros,
+                    "recorder pressure"
+                );
+                self.max_write_micros = 0;
+                last_report = Instant::now();
             }
         }
         bail!("input channel closed")
@@ -231,8 +262,8 @@ impl State {
     fn finalize(&mut self, play: Vec<Span>) -> Result<()> {
         self.session.as_mut().expect("an open match").play = play;
         self.close_open_spans();
-        self.decide_all()?;
         self.config.recording.store(false, Ordering::Relaxed);
+        self.decide_all()?;
         self.finish_session()?;
         self.pairer = Pairer::default();
         self.audio.clear();
@@ -328,10 +359,17 @@ impl State {
         let margins = *self.config.margins.borrow();
         let play = self.session.as_ref().expect("session").play.clone();
         let confirmed_at = self.confirmed_at;
+        let buffer = (*self.config.buffer.borrow()).min(MAX_MEMORY_BUFFER);
+        let Some(decide_before) = self.frames.back().map(Held::timestamp).map(|newest| newest - buffer) else {
+            return Ok(());
+        };
         loop {
             let Some(timestamp) = self.frames.front().map(Held::timestamp) else {
                 break;
             };
+            if timestamp > decide_before {
+                break;
+            }
             match fate(timestamp, &play, margins, confirmed_at) {
                 Fate::Wait => break,
                 Fate::Drop => {
@@ -350,7 +388,7 @@ impl State {
     }
 
     fn spill(&mut self) -> Result<()> {
-        let limit = self.config.buffer.borrow().as_micros() as i64;
+        let limit = (*self.config.buffer.borrow()).min(MAX_MEMORY_BUFFER).as_micros() as i64;
         loop {
             let newest = self.frames.iter().rev().find_map(|held| match held {
                 Held::Memory(frame) => Some(frame.timestamp),
@@ -370,16 +408,19 @@ impl State {
                 self.frames.insert(index, held);
                 break;
             };
+            let started = Instant::now();
             if let Err(error) = self.spill_frame(&frame) {
                 self.frames.insert(index, Held::Memory(frame));
                 return Err(error);
             }
+            self.max_write_micros = self.max_write_micros.max(started.elapsed().as_micros());
             self.frames.insert(index, Held::Disk(frame.timestamp));
         }
         Ok(())
     }
 
     fn write_frame(&mut self, frame: StereoFrame) -> Result<()> {
+        let started = Instant::now();
         let margins = *self.config.margins.borrow();
         let session = self.session.as_mut().expect("a frame is written during a session");
         let before = session.segments.len();
@@ -387,6 +428,7 @@ impl State {
         if session.segments.len() != before {
             self.config.uploads.notify_one();
         }
+        self.max_write_micros = self.max_write_micros.max(started.elapsed().as_micros());
         Ok(())
     }
 
@@ -409,7 +451,7 @@ impl State {
         session.close()?;
         self.finished.insert(session.match_id.clone());
         if session.segments.is_empty() {
-            tracing::info!("match {} had no play; discarding", session.match_id);
+            tracing::info!("match {} had no recorded footage; discarding", session.match_id);
             fs::remove_dir_all(&session.dir)?;
             return Ok(());
         }
@@ -451,7 +493,7 @@ impl State {
             Held::Memory(frame) => Ok(frame),
             Held::Disk(timestamp) => {
                 let paths = self.hold_paths(timestamp);
-                let jpegs = [fs::read(&paths[0])?, fs::read(&paths[1])?];
+                let jpegs = [fs::read(&paths[0])?.into(), fs::read(&paths[1])?.into()];
                 self.discard(Held::Disk(timestamp))?;
                 Ok(StereoFrame { timestamp, jpegs })
             }
@@ -582,7 +624,7 @@ impl OpenSegment {
             segment,
             last: StereoFrame {
                 timestamp: first.timestamp,
-                jpegs: Default::default(),
+                jpegs: [Arc::<[u8]>::from([]), Arc::<[u8]>::from([])],
             },
             video: [create(Side::Left.file_name())?, create(Side::Right.file_name())?],
             audio: audio.then(|| create(AUDIO_FILE)).transpose()?,
@@ -611,7 +653,7 @@ impl OpenSegment {
 
     fn finish(self) -> Result<Segment> {
         for writer in self.video.into_iter().chain(self.audio) {
-            writer.into_inner()?.sync_all()?;
+            writer.into_inner()?;
         }
         Ok(self.segment)
     }
@@ -635,7 +677,7 @@ mod tests {
     }
 
     fn state(root: &Path, buffer: Duration) -> State {
-        let (_margins, margins) = watch::channel(DEFAULT_MARGINS);
+        let (_margins, margins) = watch::channel(protocol::DEFAULT_MARGINS);
         let (_buffer, buffer) = watch::channel(buffer);
         State::new(Recorder {
             root: root.to_owned(),
@@ -666,7 +708,7 @@ mod tests {
             for frame in state.pairer.push(CameraFrame {
                 side,
                 timestamp,
-                jpeg: vec![1, 2, 3],
+                jpeg: Arc::from([1, 2, 3]),
             }) {
                 state.frames.push_back(Held::Memory(frame));
             }
@@ -688,9 +730,9 @@ mod tests {
     }
 
     #[test]
-    fn an_open_point_holds_its_frames() {
+    fn a_confirmed_open_point_is_kept() {
         let play = [Span { start: at(0), end: None }];
-        assert_eq!(fate(at(100), &play, margins(), at(1_000)), Fate::Wait);
+        assert_eq!(fate(at(100), &play, margins(), at(1_000)), Fate::Keep);
     }
 
     #[test]
@@ -785,11 +827,11 @@ mod tests {
         let mut state = state(&root, Duration::ZERO);
         state.frames.push_back(Held::Memory(StereoFrame {
             timestamp: at(0),
-            jpegs: [vec![7], vec![8]],
+            jpegs: [Arc::from([7]), Arc::from([8])],
         }));
         state.frames.push_back(Held::Memory(StereoFrame {
             timestamp: at(2),
-            jpegs: [vec![9], vec![10]],
+            jpegs: [Arc::from([9]), Arc::from([10])],
         }));
         state.spill()?;
         assert!(matches!(state.frames.front(), Some(Held::Disk(_))));

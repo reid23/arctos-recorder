@@ -4,15 +4,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
-use protocol::{Side, rig};
+use protocol::Side;
 use turbojpeg::{Compressor, Decompressor, Subsamp, YuvImage};
 
 use crate::geometry::StitchConfig;
 use crate::gpu::{Gpu, Output, OverlayImage, Stitcher, YuvPlanes};
 use crate::overlay::PlacedImage;
 
-/// Frame rate of the previews.
-pub const FPS: u32 = rig::FPS / rig::PREVIEW_DECIMATION;
+/// Frame rate sent to stream servers. Sparse preview inputs are duplicated.
+pub const FPS: u32 = 30;
 /// Of the stitched panoramas, which are compressed again to be restreamed.
 const JPEG_QUALITY: i32 = 90;
 

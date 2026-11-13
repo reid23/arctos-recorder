@@ -79,10 +79,15 @@ impl Jobs {
             _ => Vec::new(),
         };
         let has_token = self.token(key).borrow().is_some();
+        let traffic = self.arctos.traffic();
         Ok(Some(JobState {
             status,
             missing,
             has_token,
+            arctos: stitching::cloud::Transfer {
+                sent: traffic.sent(),
+                received: traffic.received(),
+            },
         }))
     }
 

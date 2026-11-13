@@ -4,6 +4,7 @@
 //! only considered once it is [`SETTLE`] older than the newest frame seen.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use protocol::{Side, Timestamp, rig};
@@ -16,12 +17,12 @@ const MAX_SKEW_MICROS: i64 = rig::frame_micros() / 2;
 pub struct StereoFrame {
     pub timestamp: Timestamp,
     /// Indexed by [`Side::index`].
-    pub jpegs: [Vec<u8>; 2],
+    pub jpegs: [Arc<[u8]>; 2],
 }
 
 #[derive(Default)]
 pub struct Pairer {
-    pending: [BTreeMap<Timestamp, Vec<u8>>; 2],
+    pending: [BTreeMap<Timestamp, Arc<[u8]>>; 2],
     newest: Option<Timestamp>,
 }
 

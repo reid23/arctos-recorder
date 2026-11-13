@@ -37,6 +37,7 @@ pub async fn run(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) {
                 *bitrate,
                 link.panorama.subscribe(),
                 restream::Audio::Pcm(&audio_url),
+                hub.network.stream_sent(&camera),
             ) => {
                 if let Err(e) = result {
                     tracing::warn!("restreaming {camera}: {e:#}");

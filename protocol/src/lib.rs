@@ -20,12 +20,14 @@ pub mod rig {
     /// Live preview resolutions each camera can be told to send: scaled by
     /// the ISP from the same 16:9 sensor mode, so all with the same field of
     /// view.
-    pub const PREVIEW_SIZES: [(u32, u32); 4] = [(1280, 720), (1536, 864), (1920, 1080), (2304, 1296)];
+    pub const PREVIEW_SIZES: [(u32, u32); 1] = [(1536, 864)];
     pub const DEFAULT_PREVIEW_SIZE: (u32, u32) = (1536, 864);
     /// Sensor frame rate.
     pub const FPS: u32 = 56;
-    /// Every `PREVIEW_DECIMATION`th sensor frame is sent as a preview frame.
-    pub const PREVIEW_DECIMATION: u32 = 2;
+    /// Every `IDLE_PREVIEW_DECIMATION`th sensor frame is encoded while idle.
+    pub const IDLE_PREVIEW_DECIMATION: u32 = 4;
+    /// Every `RECORD_PREVIEW_DECIMATION`th recording JPEG is also sent live.
+    pub const RECORD_PREVIEW_DECIMATION: u32 = 2;
     /// Audio is recorded as mono signed 16-bit little-endian PCM at this rate.
     pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
 
@@ -101,6 +103,9 @@ impl Side {
 /// Sent by a camera when it (re)connects to the base station.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Registration {
+    /// Identifies the exact camera software build. Older cameras omit it.
+    #[serde(default)]
+    pub software_id: Option<String>,
     /// The rig's calibration (a `stitching::geometry::Calibration`). Opaque
     /// to the camera.
     pub calibration: serde_json::Value,
@@ -133,7 +138,7 @@ pub const DEFAULT_MARGINS: Margins = Margins {
 };
 /// How long cameras keep undecided frames in memory unless told otherwise
 /// (see [`Instructions::buffer`]). Older undecided frames spill to disk.
-pub const DEFAULT_BUFFER: Duration = Duration::from_secs(12);
+pub const DEFAULT_BUFFER: Duration = Duration::from_secs(6);
 
 /// What the base station currently wants a camera to do, polled at 1 Hz.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -199,6 +204,21 @@ pub struct CameraStats {
     pub frames: [FrameCounts; 2],
     /// The last autofocus asked for since the camera software started.
     pub autofocus: Option<AutofocusOutcome>,
+    /// The link the camera reaches the base station on, if it could be read.
+    #[serde(default)]
+    pub link: Option<Link>,
+}
+
+/// Bytes on a network link since the machine booted, and how fast it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Link {
+    /// Megabits a second the link can carry. Absent when the operating
+    /// system won't say, as with Wi-Fi.
+    pub megabits: Option<u32>,
+    /// Sent from this machine.
+    pub sent: u64,
+    /// Received by this machine.
+    pub received: u64,
 }
 
 /// Where autofocusing put a camera's lenses.
@@ -339,12 +359,13 @@ impl MatchManifest {
 #[derive(Clone, Debug)]
 pub struct PreviewFrame<B> {
     pub side: Side,
+    pub timestamp: Timestamp,
     pub jpeg: B,
 }
 
 /// A message of the live preview WebSocket, sent as one binary message:
-/// `[tag: u8][payload...]`. The tag is the frame's [`Side`] for frames and
-/// [`AUDIO_TAG`] for audio.
+/// `[frame tag: u8][timestamp: i64 LE][jpeg...]` for frames, or
+/// `[AUDIO_TAG: u8][pcm...]` for audio.
 #[derive(Clone, Debug)]
 pub enum PreviewMessage<B> {
     Frame(PreviewFrame<B>),
@@ -354,34 +375,92 @@ pub enum PreviewMessage<B> {
 }
 
 const AUDIO_TAG: u8 = 2;
+const FRAME_TAG_BASE: u8 = 3;
 
 impl<B: AsRef<[u8]>> PreviewMessage<B> {
     pub fn encode(&self) -> Vec<u8> {
-        let (tag, payload) = match self {
-            PreviewMessage::Frame(frame) => (frame.side as u8, frame.jpeg.as_ref()),
-            PreviewMessage::Audio(pcm) => (AUDIO_TAG, pcm.as_ref()),
-        };
-        let mut out = Vec::with_capacity(1 + payload.len());
-        out.push(tag);
-        out.extend_from_slice(payload);
-        out
+        match self {
+            PreviewMessage::Frame(frame) => {
+                let jpeg = frame.jpeg.as_ref();
+                let mut out = Vec::with_capacity(9 + jpeg.len());
+                out.push(FRAME_TAG_BASE + frame.side as u8);
+                out.extend_from_slice(&frame.timestamp.0.to_le_bytes());
+                out.extend_from_slice(jpeg);
+                out
+            }
+            PreviewMessage::Audio(pcm) => {
+                let pcm = pcm.as_ref();
+                let mut out = Vec::with_capacity(1 + pcm.len());
+                out.push(AUDIO_TAG);
+                out.extend_from_slice(pcm);
+                out
+            }
+        }
     }
+}
+
+/// The interface in a Linux `/proc/net/route` table that carries packets to
+/// `address`, or the default route when `address` is absent. Absent when
+/// the table has no usable route.
+pub fn route_interface(table: &str, address: Option<std::net::Ipv4Addr>) -> Option<&str> {
+    let wanted = address.map(u32::from);
+    let mut best: Option<(&str, u32)> = None;
+    for line in table.lines().skip(1) {
+        let Some((interface, destination, mask)) = route_row(line) else {
+            continue;
+        };
+        let matches = match wanted {
+            Some(address) => address & mask == destination,
+            None => destination == 0,
+        };
+        if matches && best.is_none_or(|(_, best_mask)| mask >= best_mask) {
+            best = Some((interface, mask));
+        }
+    }
+    best.map(|(interface, _)| interface)
+}
+
+/// One data row of `/proc/net/route`: interface, destination and mask, in
+/// host byte order.
+fn route_row(line: &str) -> Option<(&str, u32, u32)> {
+    let mut fields = line.split_whitespace();
+    let interface = fields.next()?;
+    if interface.is_empty() || interface.contains('/') {
+        return None;
+    }
+    let destination = u32::from_str_radix(fields.next()?, 16).ok()?.swap_bytes();
+    let mask = u32::from_str_radix(fields.nth(5)?, 16).ok()?.swap_bytes();
+    Some((interface, destination, mask))
 }
 
 impl PreviewMessage<Bytes> {
     /// Splits an encoded message; `None` if it is malformed.
     pub fn decode(message: Bytes) -> Option<Self> {
-        let payload = message.slice(1..);
-        Some(match *message.first()? {
+        let tag = *message.first()?;
+        if tag == AUDIO_TAG {
+            return Some(PreviewMessage::Audio(message.slice(1..)));
+        }
+        Some(match tag {
             0 => PreviewMessage::Frame(PreviewFrame {
                 side: Side::Left,
-                jpeg: payload,
+                timestamp: Timestamp(0),
+                jpeg: message.slice(1..),
             }),
             1 => PreviewMessage::Frame(PreviewFrame {
                 side: Side::Right,
-                jpeg: payload,
+                timestamp: Timestamp(0),
+                jpeg: message.slice(1..),
             }),
-            AUDIO_TAG => PreviewMessage::Audio(payload),
+            FRAME_TAG_BASE => PreviewMessage::Frame(PreviewFrame {
+                side: Side::Left,
+                timestamp: Timestamp(i64::from_le_bytes(message.get(1..9)?.try_into().ok()?)),
+                jpeg: message.slice(9..),
+            }),
+            tag if tag == FRAME_TAG_BASE + 1 => PreviewMessage::Frame(PreviewFrame {
+                side: Side::Right,
+                timestamp: Timestamp(i64::from_le_bytes(message.get(1..9)?.try_into().ok()?)),
+                jpeg: message.slice(9..),
+            }),
             _ => return None,
         })
     }
@@ -390,6 +469,34 @@ impl PreviewMessage<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_route_picks_the_most_specific_interface() {
+        let table = "\
+Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+wlan0 00000000 0100A8C0 0003 0 0 200 00000000 0 0 0
+eth0 00002A0A 00000000 0001 0 0 100 00FFFFFF 0 0 0
+";
+        let camera_network = std::net::Ipv4Addr::new(10, 42, 0, 5);
+        assert_eq!(route_interface(table, Some(camera_network)), Some("eth0"));
+        assert_eq!(
+            route_interface(table, Some(std::net::Ipv4Addr::new(1, 2, 3, 4))),
+            Some("wlan0")
+        );
+        assert_eq!(route_interface(table, None), Some("wlan0"));
+    }
+
+    #[test]
+    fn an_old_camera_report_has_no_link() {
+        let stats: CameraStats = serde_json::from_str(
+            r#"{"cpu":null,"memory":null,"temperature":null,"frames":[
+                {"captured":0,"dropped":0,"previews":0,"previews_dropped":0},
+                {"captured":0,"dropped":0,"previews":0,"previews_dropped":0}
+            ],"autofocus":null}"#,
+        )
+        .unwrap();
+        assert_eq!(stats.link, None);
+    }
 
     #[test]
     fn spans_cover_their_margins() {

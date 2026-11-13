@@ -246,6 +246,19 @@ pub fn Settings() -> Element {
         }
         fieldset {
             legend { "Recordings" }
+            TextInput {
+                label: "Folder",
+                title: "Where match videos are stored. Leave this blank to keep them in the data directory. \
+                        A full path. Used the next time the app starts; videos already stored stay where they are",
+                value: settings.recordings_dir.clone(),
+                placeholder: "Inside the data directory",
+                onchange: {
+                    let hub = hub.clone();
+                    move |directory: String| {
+                        hub.update_settings(|s| s.recordings_dir = directory.trim().to_owned())
+                    }
+                },
+            }
             NumberInput {
                 label: "JPEG quality",
                 title: "How finely the cameras compress the frames they record, out of 100. Higher keeps more detail \
@@ -404,8 +417,7 @@ fn CameraNetwork() -> Element {
         fieldset {
             legend { "Camera network" }
             label { class: "row",
-                title: "The wired port the cameras' switch is plugged into, which gets a self-assigned address to reach \
-                        them by instead of waiting for a DHCP server. Choose a port only the cameras are on",
+                title: "The wired port the cameras' switch is plugged into. Choose a port only the cameras are on",
                 span { class: "label", "Port" }
                 select {
                     onchange: move |e: FormEvent| {

@@ -8,11 +8,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use protocol::Side;
-use stitching::cloud::LiveConfig;
+use protocol::rig;
+use stitching::cloud::{CloudTraffic, LiveConfig, LiveUpdate};
 use stitching::encode::LiveEncoding;
 use stitching::live::{self, LiveStitcher, StereoYuv};
-use stitching::overlay::{self, LiveOverlay, PlacedImage};
+use stitching::overlay::{self, PlacedImage};
 use stitching::restream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -22,7 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 use turbojpeg::Decompressor;
 
 use crate::cloud::Cloud;
-use crate::hub::{CameraLink, Hub};
+use crate::hub::{CameraLink, Hub, StereoPreview};
 use crate::server::Feed;
 use crate::settings::{Settings, Stitching};
 
@@ -91,24 +91,28 @@ fn stitch_locally(
     overlay: &watch::Receiver<Option<Arc<PlacedImage>>>,
 ) -> Result<()> {
     let mut config = link.stitch.subscribe();
-    let mut left = link.previews[Side::Left.index()].subscribe();
-    let right = link.previews[Side::Right.index()].subscribe();
+    let mut previews = link.live.subscribe();
     let mut stitcher: Option<LiveStitcher> = None;
     let mut decompressors = [Decompressor::new()?, Decompressor::new()?];
     let mut frame: Option<StereoYuv> = None;
 
     loop {
-        // Paced by the left camera; the right one is never more than a frame apart.
-        runtime.block_on(left.changed())?;
+        let preview = match runtime.block_on(previews.recv()) {
+            Ok(preview) => preview,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let Some(preview) = newest_preview(&mut previews) else {
+                    continue;
+                };
+                preview
+            }
+            Err(error) => return Err(error.into()),
+        };
         if hub.settings.borrow().stitching != Stitching::Local
             && !hub.calibrating.borrow().contains(camera)
         {
             continue;
         }
-        let Some(previews) = latest(&mut left, &right) else {
-            continue;
-        };
-        let Some(preview_size) = live::pair_size([&previews[0], &previews[1]])? else {
+        let Some(preview_size) = live::pair_size([&preview.jpegs[0], &preview.jpegs[1]])? else {
             continue;
         };
         let size = hub.settings.borrow().live_size(camera);
@@ -136,18 +140,19 @@ fn stitch_locally(
             frame = None;
         }
         let frame = frame.get_or_insert_with(|| StereoYuv::new(preview_size));
-        decode(&mut decompressors, frame, &previews)?;
+        decode(&mut decompressors, frame, &preview.jpegs)?;
         let overlay = overlay.borrow().clone();
         let jpeg = stitcher.stitch(frame, overlay.as_ref())?;
         link.panorama.send_replace(Some(jpeg));
     }
 }
 
-type Preview = watch::Receiver<Option<Bytes>>;
-
-/// The latest pair of previews; `None` until both cameras have sent one.
-fn latest(left: &mut Preview, right: &Preview) -> Option<[Bytes; 2]> {
-    Some([left.borrow_and_update().clone()?, right.borrow().clone()?])
+fn newest_preview(receiver: &mut tokio::sync::broadcast::Receiver<StereoPreview>) -> Option<StereoPreview> {
+    let mut newest = None;
+    while let Ok(preview) = receiver.try_recv() {
+        newest = Some(preview);
+    }
+    newest
 }
 
 fn decode(
@@ -166,7 +171,6 @@ struct Forwarding {
     size: (u32, u32),
     bitrate: f64,
     forward_bitrate: f64,
-    overlay: Option<LiveOverlay>,
 }
 
 impl Forwarding {
@@ -178,14 +182,13 @@ impl Forwarding {
             size: settings.live_size(camera),
             bitrate: settings.live.bitrate,
             forward_bitrate: settings.live.forward_bitrate,
-            overlay: settings.live_overlay(camera),
         })
     }
 }
 
 /// Forwards the previews to the cloud server while stitching in the cloud
 /// and restreaming, reconnecting whenever where to forward them or their
-/// size changes.
+/// size changes. Overlay changes go over the open connection.
 async fn forward_to_cloud(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) {
     let mut settings = hub.settings.subscribe();
     loop {
@@ -201,7 +204,13 @@ async fn forward_to_cloud(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) 
         match forwarding {
             None => changed.await,
             Some(forwarding) => tokio::select! {
-                result = forward(&camera, &link, &forwarding) => {
+                result = forward(
+                    &camera,
+                    &link,
+                    &forwarding,
+                    hub.settings.subscribe(),
+                    hub.network.clone(),
+                ) => {
                     if let Err(e) = result {
                         tracing::warn!("forwarding {camera} to the cloud: {e:#}");
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -213,40 +222,63 @@ async fn forward_to_cloud(hub: Arc<Hub>, camera: String, link: Arc<CameraLink>) 
     }
 }
 
-/// Forwards the previews until something fails, or until their size changes
-/// and the cloud server must be told.
-async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Result<()> {
-    let mut left = link.previews[Side::Left.index()].subscribe();
-    let right = link.previews[Side::Right.index()].subscribe();
-    let preview_size = loop {
-        left.changed().await?;
-        if let Some(previews) = latest(&mut left, &right)
-            && let Some(preview_size) = live::pair_size([&previews[0], &previews[1]])?
-        {
-            break preview_size;
+/// Forwards previews until something fails or the destination changes.
+async fn forward(
+    camera: &str,
+    link: &CameraLink,
+    forwarding: &Forwarding,
+    mut settings: watch::Receiver<Settings>,
+    network: Arc<crate::network::Network>,
+) -> Result<()> {
+    let mut previews = link.live.subscribe();
+    let first = loop {
+        match previews.recv().await {
+            Ok(preview) => break preview,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                if let Some(preview) = newest_preview(&mut previews) {
+                    break preview;
+                }
+            }
+            Err(error) => return Err(error.into()),
         }
     };
+    let Some(source_size) = live::pair_size([&first.jpegs[0], &first.jpegs[1]])? else {
+        anyhow::bail!("the camera preview sizes differ");
+    };
+    let preview_size = rig::DEFAULT_PREVIEW_SIZE;
 
-    let cloud = Cloud::new(&forwarding.cloud);
+    let cloud = Cloud::new(&forwarding.cloud, network.cloud());
     let (mut socket, _) = tokio_tungstenite::connect_async(cloud.live_request(camera)?).await?;
     let mut stitch = link.stitch.subscribe();
+    let mut overlay = settings.borrow_and_update().live_overlay(camera);
     let config = LiveConfig {
         stitch: (**stitch.borrow_and_update()).clone(),
         preview_size,
         size: forwarding.size,
         destination: forwarding.destination.clone(),
         bitrate: forwarding.bitrate,
-        overlay: forwarding.overlay.clone(),
+        overlay: overlay.clone(),
     };
-    socket
-        .send(Message::text(serde_json::to_string(&config)?))
-        .await?;
+    let config = serde_json::to_string(&config)?;
+    network.cloud().add_sent(config.len() as u64);
+    socket.send(Message::text(config)).await?;
     tracing::info!("forwarding {camera} to the cloud");
 
-    let frame = StereoYuv::new(preview_size);
+    let frame = StereoYuv::new(source_size);
     let (width, height) = frame.stacked_size();
     let fps = live::FPS.to_string();
     let encoding = LiveEncoding::find().await?;
+    let scale = format!(
+        "scale={}:{}:in_range=pc:out_range=pc",
+        preview_size.0,
+        preview_size.1 * 2
+    );
+    let mut output_args: Vec<String> = encoding.output_args.iter().map(|argument| argument.to_string()).collect();
+    if let Some(filter) = output_args.iter().position(|argument| argument == "-vf") {
+        output_args[filter + 1] = format!("{scale},{}", output_args[filter + 1]);
+    } else {
+        output_args.splice(0..0, ["-vf".to_owned(), scale]);
+    }
     let mut encoder = Command::new(stitching::ffmpeg_program())
         .args(["-loglevel", "error"])
         .args(encoding.input_args)
@@ -258,12 +290,14 @@ async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Re
             "yuv420p",
             "-color_range",
             "pc",
+            "-framerate",
+            "1000",
         ])
         .args(["-video_size", &format!("{width}x{height}"), "-i", "-"])
         .args(restream::Audio::Pcm(&Feed::Audio.url(camera)).input_args())
         .args(["-map", "0:v"])
         .args(restream::AUDIO_OUTPUT_ARGS)
-        .args(encoding.output_args)
+        .args(output_args)
         .args(restream::bitrate_args(forwarding.forward_bitrate))
         .args(["-g", &fps, "-color_range", "pc"])
         .args(["-fps_mode", "passthrough", "-f", "mpegts", "-"])
@@ -279,13 +313,23 @@ async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Re
     let sink = tokio::sync::Mutex::new(sink);
     let compose = async {
         let mut decoder = ([Decompressor::new()?, Decompressor::new()?], frame);
+        let mut first = Some(first);
         loop {
-            left.changed().await?;
-            let Some(previews) = latest(&mut left, &right) else {
-                continue;
+            let preview = match first.take() {
+                Some(preview) => preview,
+                None => match previews.recv().await {
+                    Ok(preview) => preview,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(preview) = newest_preview(&mut previews) else {
+                            continue;
+                        };
+                        preview
+                    }
+                    Err(error) => return Err(error.into()),
+                },
             };
-            match live::pair_size([&previews[0], &previews[1]])? {
-                Some(size) if size == preview_size => {}
+            match live::pair_size([&preview.jpegs[0], &preview.jpegs[1]])? {
+                Some(size) if size == source_size => {}
                 Some((width, height)) => {
                     tracing::info!("{camera}'s previews are now {width} by {height}");
                     return Ok(());
@@ -295,7 +339,7 @@ async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Re
             let decoded;
             (decoded, decoder) = tokio::task::spawn_blocking(move || {
                 let (mut decompressors, mut frame) = decoder;
-                let decoded = decode(&mut decompressors, &mut frame, &previews);
+                let decoded = decode(&mut decompressors, &mut frame, &preview.jpegs);
                 (decoded, (decompressors, frame))
             })
             .await?;
@@ -310,6 +354,7 @@ async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Re
         loop {
             let len = encoded.read(&mut chunk).await?;
             anyhow::ensure!(len > 0, "encoder stopped");
+            network.cloud().add_sent(len as u64);
             sink.lock()
                 .await
                 .send(Message::binary(chunk[..len].to_vec()))
@@ -317,15 +362,48 @@ async fn forward(camera: &str, link: &CameraLink, forwarding: &Forwarding) -> Re
         }
     };
     let update_config = async {
-        while stitch.changed().await.is_ok() {
-            let config = serde_json::to_string(&**stitch.borrow_and_update())?;
-            sink.lock().await.send(Message::text(config)).await?;
+        loop {
+            tokio::select! {
+                changed = stitch.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                    let update = LiveUpdate::Stitch((**stitch.borrow_and_update()).clone());
+                    let config = serde_json::to_string(&update)?;
+                    network.cloud().add_sent(config.len() as u64);
+                    sink.lock().await.send(Message::text(config)).await?;
+                }
+                changed = settings.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                    let next = settings.borrow().live_overlay(camera);
+                    if next == overlay {
+                        continue;
+                    }
+                    overlay = next;
+                    let update = LiveUpdate::Overlay { overlay: overlay.clone() };
+                    let text = serde_json::to_string(&update)?;
+                    network.cloud().add_sent(text.len() as u64);
+                    sink.lock().await.send(Message::text(text)).await?;
+                }
+            }
         }
-        anyhow::Ok(())
     };
     let receive = async {
         while let Some(message) = incoming.next().await {
-            message?;
+            let message = message?;
+            let bytes = match &message {
+                Message::Binary(data) => data.len(),
+                Message::Text(text) => text.len(),
+                _ => 0,
+            };
+            network.cloud().add_received(bytes as u64);
+            if let Message::Text(text) = &message
+                && let Ok(traffic) = serde_json::from_str::<CloudTraffic>(text)
+            {
+                network.note_cloud(camera, traffic);
+            }
         }
         anyhow::bail!("the cloud server closed the connection")
     };

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -27,6 +27,9 @@ pub struct Settings {
     pub recording: RecordingSettings,
     pub overlay: Overlay,
     pub panes: Panes,
+    /// Directory match videos are written to. Empty keeps them in the data
+    /// directory's `recordings` folder. Read when the app starts.
+    pub recordings_dir: String,
     /// By camera id.
     pub cameras: BTreeMap<String, CameraSettings>,
 }
@@ -101,7 +104,7 @@ pub struct LiveSettings {
 impl LiveSettings {
     pub const WIDTHS: RangeInclusive<u32> = 320..=3840;
     pub const BITRATES: RangeInclusive<f64> = 0.5..=50.0;
-    pub const CAMERA_QUALITIES: RangeInclusive<u8> = 20..=100;
+    pub const CAMERA_QUALITIES: RangeInclusive<u8> = 20..=DEFAULT_PREVIEW_QUALITY;
 }
 
 fn default_forward_bitrate() -> f64 {
@@ -139,8 +142,8 @@ impl RecordingSettings {
     /// Of each margin, in seconds.
     pub const MARGINS: RangeInclusive<f64> = 0.0..=20.0;
     /// In seconds. The buffer takes about 16 MB of a camera's memory a
-    /// second at the default JPEG quality, and the cameras have 2 GB.
-    pub const BUFFERS: RangeInclusive<f64> = 1.0..=30.0;
+    /// second at the default JPEG quality.
+    pub const BUFFERS: RangeInclusive<f64> = 1.0..=6.0;
 }
 
 impl Default for RecordingSettings {
@@ -162,6 +165,10 @@ pub struct Panes {
     pub jobs: bool,
     pub settings: bool,
     pub performance: bool,
+    pub network: bool,
+    /// Cameras' share of the column's height when Network Usage is open too.
+    #[serde(default = "default_cameras_share")]
+    pub cameras_share: f64,
     /// Width in pixels of the column holding Settings and Jobs, next to
     /// Cameras.
     pub side_width: f64,
@@ -173,6 +180,10 @@ pub struct Panes {
     pub performance_width: f64,
 }
 
+fn default_cameras_share() -> f64 {
+    0.62
+}
+
 impl Default for Panes {
     fn default() -> Self {
         Panes {
@@ -180,6 +191,8 @@ impl Default for Panes {
             jobs: false,
             settings: false,
             performance: false,
+            network: false,
+            cameras_share: default_cameras_share(),
             side_width: 380.0,
             settings_share: 0.5,
             camera_width: 480.0,
@@ -257,12 +270,28 @@ impl RigSetup {
 }
 
 impl Settings {
-    pub fn load(path: &Path) -> Result<Self> {
-        match std::fs::read(path) {
-            Ok(json) => Ok(serde_json::from_slice(&json)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
-            Err(e) => Err(e.into()),
+    /// Where match videos go. A blank [`Settings::recordings_dir`] keeps them
+    /// in `data_dir/recordings`.
+    pub fn recordings_directory(&self, data_dir: &Path) -> PathBuf {
+        let configured = self.recordings_dir.trim();
+        if configured.is_empty() {
+            data_dir.join("recordings")
+        } else {
+            PathBuf::from(configured)
         }
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let mut settings = match std::fs::read(path) {
+            Ok(json) => serde_json::from_slice(&json),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+            Err(e) => return Err(e.into()),
+        }?;
+        settings.live.camera_size = rig::DEFAULT_PREVIEW_SIZE;
+        settings.live.camera_quality = settings.live.camera_quality.min(DEFAULT_PREVIEW_QUALITY);
+        settings.recording.buffer =
+            settings.recording.buffer.min(Duration::from_secs_f64(*RecordingSettings::BUFFERS.end()));
+        Ok(settings)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -325,6 +354,8 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use stitching::geometry::{DEFAULT_FOCUS, Lens, magnification};
 
     use super::*;
@@ -360,6 +391,23 @@ mod tests {
         );
         let resaved = serde_json::to_value(&settings).unwrap();
         assert_eq!(resaved["cameras"]["ar-1"]["lens_positions"], serde_json::json!([9.5, 4.0]));
+    }
+
+    #[test]
+    fn a_blank_recordings_folder_stays_in_the_data_directory() {
+        let data = Path::new("/data");
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.recordings_dir, "");
+        assert_eq!(settings.recordings_directory(data), data.join("recordings"));
+
+        let settings = Settings {
+            recordings_dir: "  /videos/matches  ".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            settings.recordings_directory(data),
+            PathBuf::from("/videos/matches")
+        );
     }
 
     #[test]

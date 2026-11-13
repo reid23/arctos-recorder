@@ -14,6 +14,8 @@ rm -rf "$root"
 install -Dm755 "$work/cargo/release/bsw" "$root/usr/lib/arctos-recorder/bsw"
 strip "$root/usr/lib/arctos-recorder/bsw"
 install -Dm755 /opt/ffmpeg/ffmpeg "$root/usr/lib/arctos-recorder/ffmpeg"
+install -Dm644 target/package/pi/software-id \
+    "$root/usr/lib/arctos-recorder/camera-software-id"
 mkdir -p "$root/usr/bin"
 ln -s ../lib/arctos-recorder/bsw "$root/usr/bin/arctos-recorder"
 install -Dm644 deploy/linux/arctos-recorder.desktop "$root/usr/share/applications/arctos-recorder.desktop"
@@ -36,6 +38,8 @@ Maintainer: reid23 <reid.dye@gmail.com>
 Installed-Size: $(du -sk "$root/usr" | cut -f1)
 Depends: ${depends#shlibs:Depends=}, libvulkan1
 Recommends: network-manager, mesa-vulkan-drivers
+Conflicts: arctos-recorder-camera-image
+Replaces: arctos-recorder-camera-image
 Section: video
 Priority: optional
 Description: Arctos Recorder base station

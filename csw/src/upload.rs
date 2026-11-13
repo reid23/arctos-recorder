@@ -1,14 +1,14 @@
 //! Uploads match recordings to the base station, deleting one once the base
 //! station has acknowledged it.
 //!
-//! A segment uploads once it is finished, while later points of the match
-//! are still being recorded. An upload waits while the Pi is short on CPU
+//! Uploads wait until recording has stopped and while the Pi is short on CPU
 //! or memory.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -25,14 +25,19 @@ const RETRY: Duration = Duration::from_secs(10);
 /// How often an upload checks whether the Pi can spare it.
 const PRESSURE_INTERVAL: Duration = Duration::from_secs(1);
 
-pub async fn run(base: BaseStation, root: PathBuf, ready: Arc<tokio::sync::Notify>) {
+pub async fn run(
+    base: BaseStation,
+    root: PathBuf,
+    ready: Arc<tokio::sync::Notify>,
+    recording: Arc<AtomicBool>,
+) {
     let mut registrations = base.registrations();
     let mut uploaded = HashSet::new();
     let pressure = Arc::new(Mutex::new(Pressure::new()));
     loop {
         registrations.mark_unchanged();
         tokio::select! {
-            result = upload_all(&base, &root, &mut uploaded, &pressure) => {
+            result = upload_all(&base, &root, &mut uploaded, &pressure, &recording) => {
                 if let Err(e) = result {
                     tracing::warn!("upload failed: {e:#}");
                     tokio::time::sleep(RETRY).await;
@@ -53,7 +58,11 @@ async fn upload_all(
     root: &Path,
     uploaded: &mut HashSet<PathBuf>,
     pressure: &Arc<Mutex<Pressure>>,
+    recording: &Arc<AtomicBool>,
 ) -> Result<()> {
+    if recording.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let mut entries = tokio::fs::read_dir(root).await?;
     while let Some(entry) = entries.next_entry().await? {
         if !entry.file_type().await?.is_dir() {
@@ -71,7 +80,7 @@ async fn upload_all(
             let bytes = tokio::fs::read(dir.join(MANIFEST_FILE)).await?;
             let manifest: MatchManifest = serde_json::from_slice(&bytes)?;
             tracing::info!("uploading match {}", manifest.match_id);
-            upload_files(base, &manifest, &dir, uploaded, pressure).await?;
+            upload_files(base, &manifest, &dir, uploaded, pressure, recording).await?;
             base.upload_manifest(&manifest).await?;
             tokio::fs::remove_dir_all(&dir).await?;
             uploaded.retain(|path| !path.starts_with(&dir));
@@ -89,7 +98,7 @@ async fn upload_all(
             });
             if pending {
                 tracing::info!("uploading finished segments of match {}", manifest.match_id);
-                upload_files(base, &manifest, &dir, uploaded, pressure).await?;
+                upload_files(base, &manifest, &dir, uploaded, pressure, recording).await?;
             }
         }
     }
@@ -102,6 +111,7 @@ async fn upload_files(
     dir: &Path,
     uploaded: &mut HashSet<PathBuf>,
     pressure: &Arc<Mutex<Pressure>>,
+    recording: &Arc<AtomicBool>,
 ) -> Result<()> {
     let files: Vec<_> = manifest
         .files()
@@ -121,7 +131,7 @@ async fn upload_files(
         if uploaded.contains(path) {
             continue;
         }
-        let reader = Throttled::open(path, Arc::clone(pressure)).await?;
+        let reader = Throttled::open(path, Arc::clone(pressure), Arc::clone(recording)).await?;
         base.upload_file(&manifest.match_id, segment, file, reader)
             .await
             .with_context(|| format!("upload {}", path.display()))?;
@@ -134,19 +144,21 @@ async fn upload_files(
 struct Throttled {
     file: tokio::fs::File,
     pressure: Arc<Mutex<Pressure>>,
+    recording: Arc<AtomicBool>,
     last_check: Instant,
     pause: Option<Pin<Box<Sleep>>>,
     announced: bool,
 }
 
 impl Throttled {
-    async fn open(path: &Path, pressure: Arc<Mutex<Pressure>>) -> Result<Self> {
+    async fn open(path: &Path, pressure: Arc<Mutex<Pressure>>, recording: Arc<AtomicBool>) -> Result<Self> {
         let file = tokio::fs::File::open(path)
             .await
             .with_context(|| format!("open {}", path.display()))?;
         Ok(Throttled {
             file,
             pressure,
+            recording,
             last_check: Instant::now()
                 .checked_sub(PRESSURE_INTERVAL)
                 .unwrap_or_else(Instant::now),
@@ -174,7 +186,7 @@ impl AsyncRead for Throttled {
         }
         if self.last_check.elapsed() >= PRESSURE_INTERVAL {
             self.last_check = Instant::now();
-            if self.pressure.lock().unwrap().constrained() {
+            if self.recording.load(Ordering::Relaxed) || self.pressure.lock().unwrap().constrained() {
                 if !self.announced {
                     tracing::info!("pausing an upload; the camera is short on CPU or memory");
                     self.announced = true;

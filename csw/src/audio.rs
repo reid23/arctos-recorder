@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use alsa::device_name::HintIter;
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 use anyhow::Result;
+use crossbeam_channel::Sender;
 use protocol::{AudioDevice, rig};
 use tokio::sync::watch;
 
